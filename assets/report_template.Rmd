@@ -1,0 +1,356 @@
+---
+title: "`r params$cohort` — cohort report"
+date: "`r format(Sys.time(), '%Y-%m-%d %H:%M %Z')`"
+output:
+  html_document:
+    theme: cosmo
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    self_contained: true
+    df_print: paged
+params:
+  cohort: "MoHQ"
+  manifest: "manifest.tsv"
+  completeness: "completeness.tsv"
+  figdir: "figures"
+  run_params: "run_params.tsv"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+suppressPackageStartupMessages({
+  library(data.table); library(knitr); library(DT); library(htmltools)
+})
+
+figs <- if (dir.exists(params$figdir))
+  list.files(params$figdir, pattern = "\\.(png|html)$", full.names = TRUE) else character()
+
+# ---------------------------------------------------------------------------
+# Figure embedding.
+#
+# The previous template mixed two mechanisms: htmltools::tags$img(src=...) for
+# some panels and knitr::include_graphics() for others. include_graphics() is
+# the one that reliably survives self_contained rendering. Standardising on it
+# means the whole report travels as a single file rather than half the panels
+# breaking once it leaves the working directory.
+#
+# Interactive HTML (the PCA widget) genuinely cannot be inlined into a parent
+# self-contained document via <iframe>; that link WILL break when the file is
+# moved. We link it explicitly and say so, instead of embedding a dead frame.
+# ---------------------------------------------------------------------------
+show_fig <- function(pattern, alt = "figure") {
+  hit <- grep(pattern, figs, value = TRUE)
+  png <- hit[grepl("\\.png$", hit)]
+  if (!length(png)) return(invisible(NULL))
+  for (p in png) cat(sprintf("\n![%s](%s)\n\n", alt, p))
+  invisible(TRUE)
+}
+
+# ---------------------------------------------------------------------------
+# Missing-panel reporting.
+#
+# The previous fallbacks said things like "bypassed via user toggles" and
+# "skipped during execution optimization workflows" for every absent figure,
+# regardless of cause. Reading the report months later you could not tell
+# whether a panel was missing because you disabled it, because the process
+# crashed, or because the cohort had no such data. Those need different actions,
+# so they are reported differently here.
+# ---------------------------------------------------------------------------
+# The parameter record is staged with the figures, not passed as its own path,
+# so look for it in both places. Previously only params$run_params was tried,
+# nothing was ever staged there, and the section silently reported that no
+# parameters had been recorded -- in the one section whose whole purpose is to
+# say what the run used.
+.runp_path <- c(params$run_params,
+                file.path(params$figdir, "run_params.tsv"))
+.runp_path <- .runp_path[file.exists(.runp_path)]
+runp <- if (length(.runp_path))
+  tryCatch(fread(.runp_path[1], sep = "\t"), error = function(e) NULL) else NULL
+param_val <- function(k, default = NA) {
+  if (is.null(runp) || !"param" %in% names(runp)) return(default)
+  v <- runp[param == k]$value
+  if (length(v)) v[1] else default
+}
+
+absent <- function(pattern, toggle = NULL, data_reason = NULL) {
+  if (length(grep(pattern, figs))) return(invisible(NULL))
+  enabled <- if (!is.null(toggle)) param_val(toggle) else NA
+  msg <- if (!is.na(enabled) && tolower(as.character(enabled)) %in% c("false", "0", "no")) {
+    sprintf("**Not run.** `%s` was set to `false` for this run.", toggle)
+  } else if (!is.null(data_reason)) {
+    sprintf("**No output.** %s", data_reason)
+  } else {
+    paste("**No output, and the step was enabled.** This means the process",
+          "failed or produced nothing. Check the Nextflow log for this cohort",
+          "before interpreting the rest of this report.")
+  }
+  cat("\n<div style='padding:10px;border-left:4px solid #d95f02;background:#fff8f0;'>\n",
+      msg, "\n</div>\n\n")
+}
+
+man  <- tryCatch(fread(params$manifest, sep = "\t", na.strings = c("NA", "")),
+                 error = function(e) NULL)
+comp <- tryCatch(fread(params$completeness, sep = "\t"), error = function(e) NULL)
+
+read_tbl <- function(pat) {
+  f <- list.files(params$figdir, pattern = pat, full.names = TRUE)
+  if (!length(f)) return(NULL)
+  tryCatch(fread(f[1], sep = "\t"), error = function(e) NULL)
+}
+dt_show <- function(d, caption = NULL, digits = 3) {
+  if (is.null(d) || !nrow(d)) return(invisible(NULL))
+  num <- names(d)[vapply(d, is.numeric, logical(1))]
+  datatable(d, caption = caption, rownames = FALSE, filter = "top",
+            extensions = "Buttons",
+            options = list(pageLength = 10, scrollX = TRUE, dom = "Bfrtip",
+                           buttons = c("copy", "csv"))) |>
+    formatRound(columns = num, digits = digits)
+}
+```
+
+## What this report covers {.unnumbered}
+
+```{r summary, results='asis'}
+if (!is.null(man)) {
+  n      <- nrow(man)
+  ready  <- sum(man$analysis_ready == "yes", na.rm = TRUE)
+  multi  <- sum(man$multi_tumour == "yes", na.rm = TRUE)
+  insts  <- paste(sort(unique(man$institution)), collapse = ", ")
+  rna    <- sum(!is.na(man$expression_genes))
+
+  # DO NOT claim a single N for the whole report.
+  #
+  # The first real report said "44 analysis-ready and contribute to every figure
+  # below", while the oncoplot showed n = 20 and the copy-number figures n = 36.
+  # All three numbers were correct; the sentence was not. Each analysis has its
+  # own denominator, because each depends on a different input file being
+  # present -- mutation figures need a PCGR VCF, copy-number figures need CNA
+  # segments, expression needs RNA.
+  #
+  # Every figure below states its own n in its title. This block reports the
+  # eligible population per analysis so the differences are visible up front
+  # rather than discovered by comparing figure titles.
+  has <- function(...) {
+    cols <- c(...)
+    cols <- cols[cols %in% names(man)]
+    if (!length(cols)) return(NA_integer_)
+    # A patient counts if ANY of the listed columns is populated.
+    ok <- Reduce(`|`, lapply(cols, function(cc) !is.na(man[[cc]]) & man[[cc]] != "NA"))
+    sum(ok)
+  }
+
+  # Each row must name the column the analysis ACTUALLY reads, not the one that
+  # sounds right. The first version of this table said 49 eligible for mutations
+  # and 44 for copy number, while the figures showed 20 and 36 -- because it
+  # counted `mutation_vcf` (populated for ensemble fallbacks too, which
+  # inhibit_vep excludes) and `cna_segments` (which is the PCGR table, not the
+  # CNVkit VCF that BUILD_COHORT_SEG turns into the .seg the CNV figures use).
+  #
+  # A denominator table that disagrees with the figures is worse than none: it
+  # looks authoritative and is wrong.
+  mut_col <- if (isTRUE(as.logical(param_val("inhibit_vep", TRUE)))) "pcgr_vcf" else "mutation_vcf"
+  mut_req <- if (identical(mut_col, "pcgr_vcf"))
+    "delivered PCGR VCF (inhibit_vep is on, so ensemble-only patients are excluded)"
+  else "any somatic VCF"
+
+  cat(sprintf("**%d patients** in this cohort, **%d analysis-ready**.\n\n", n, ready))
+  cat("Each analysis uses only the patients that have its required input, so the denominators differ. Every figure states its own n.\n\n")
+  elig <- data.frame(
+    Analysis = c("Mutations (oncoplot, TMB)", "Copy number (frequency, burden)",
+                 "Expression (PCA)", "Fusions"),
+    Requires = c(mut_req, "CNVkit VCF (the cohort .seg is built from these)",
+                 "expression file", "Anno-FUSE or LINX calls"),
+    `Eligible patients` = c(has(mut_col), has("cnvkit_vcf"),
+                            has("expression_genes"), has("anno_fuse", "linx_fusion")),
+    check.names = FALSE)
+  print(kable(elig))
+  cat("\n")
+  cat("_If a figure's n differs from the number here, the analysis dropped patients for a further reason -- check its log._\n\n")
+  cat(sprintf("- Institution(s): %s\n", insts))
+  cat(sprintf("- With RNA: %d/%d\n", rna, n))
+  if (multi) cat(sprintf("- %d patient(s) have more than one tumour sample; only the lowest-aliquot tumour is used, so each patient counts once in every frequency.\n", multi))
+  if (n > ready) {
+    cat(sprintf("\n**%d patient(s) are excluded** from the analyses:\n\n", n - ready))
+    ex <- man[analysis_ready != "yes", .(patient_id, missing = missing_core)]
+    print(kable(ex))
+    cat("\n")
+  }
+} else {
+  cat("_Manifest unavailable._\n")
+}
+```
+
+### Parameters this run used {.unnumbered}
+
+```{r params_table}
+# The previous report showed figures with no record of the thresholds behind
+# them. For an archive that will be read years later, the parameters are as
+# important as the plots.
+if (!is.null(runp)) {
+  datatable(runp, rownames = FALSE, options = list(pageLength = 8, dom = "tp"))
+} else {
+  cat("_No parameter record staged._")
+}
+```
+
+> **Mutation data provenance.** The MAFs distributed in the MoHQ collection are
+> not gene-annotated (`Hugo_Symbol` is `Unknown` throughout). Every mutation
+> figure below is built from MAFs regenerated from the PCGR VCFs with
+> vcf2maf + VEP inside this pipeline, not from the collection MAFs.
+
+---
+
+## Data completeness
+
+```{r completeness, results='asis'}
+show_fig("completeness_heatmap", "Completeness")
+absent("completeness", data_reason = "No completeness matrix was produced.")
+```
+
+```{r completeness_tbl}
+if (!is.null(comp)) {
+  ac <- setdiff(names(comp), c("cohort_id", "patient_id", "analysis_ready"))
+  s <- data.table(asset = ac,
+                  present = vapply(ac, function(a) sum(comp[[a]] == "yes"), numeric(1)),
+                  total = nrow(comp))
+  s[, pct := round(100 * present / total, 1)]
+  dt_show(s[order(pct)], "Completeness by asset (sortable, exportable)", digits = 1)
+}
+```
+
+## Somatic mutations
+
+```{r onco, results='asis'}
+show_fig("_oncoprint\\.png", "Oncoplot")
+absent("_oncoprint\\.png", toggle = "run_oncoprint")
+```
+
+```{r gene_tbl}
+dt_show(read_tbl("_gene_summary\\.tsv$"), "Per-gene mutation summary")
+```
+
+```{r tmb, results='asis'}
+show_fig("_tmb\\.png", "Tumour mutational burden")
+```
+
+```{r tmb_tbl}
+tmb <- read_tbl("_tmb\\.tsv$")
+if (!is.null(tmb)) {
+  cat(sprintf("\nTMB assumes **%s Mb** of callable territory. ",
+              param_val("callable_mb", "?")))
+  cat("If that does not match the assay (~30 Mb exome, ~2800 Mb WGS), every TMB value scales proportionally.\n\n")
+  dt_show(tmb, "Tumour mutational burden per patient")
+}
+```
+
+```{r pathways, results='asis'}
+show_fig("_pathways\\.png", "Oncogenic pathways")
+show_fig("_somatic_interactions", "Mutual exclusivity / co-occurrence")
+```
+
+## Copy number
+
+```{r cnvfreq, results='asis'}
+show_fig("_cnv_frequency", "Genome-wide CNV frequency")
+absent("_cnv_frequency", toggle = "run_cnv_frequency")
+```
+
+```{r burden, results='asis'}
+show_fig("_cnv_burden\\.png", "Copy-number burden")
+absent("_cnv_burden\\.png", toggle = "run_cnv_burden")
+show_fig("_by_institution", "FGA by institution")
+```
+
+```{r fga_tbl}
+fga <- read_tbl("_cnv_burden\\.tsv$")
+if (!is.null(fga)) {
+  dt_show(fga, "Fraction of Genome Altered per patient")
+  if ("low_coverage" %in% names(fga) && any(fga$low_coverage)) {
+    cat(sprintf("\n**%d patient(s) flagged low-coverage** (profiled over less than %s Mb of autosome). Their FGA is not comparable to the rest of the cohort.\n",
+                sum(fga$low_coverage), param_val("min_profiled_mb", "?")))
+  }
+}
+```
+
+> FGA is altered autosomal length divided by the length **actually profiled for
+> that patient**, not by a fixed genome size. `profiled_mb` in the table above
+> shows that footprint.
+
+## Expression
+
+```{r pca, results='asis'}
+show_fig("_expression_pca\\.png", "Expression PCA")
+absent("_expression_pca\\.png", toggle = "run_pca",
+       data_reason = "This cohort has fewer than three RNA samples, so a PCA cannot be computed.")
+show_fig("_pca_scree", "Scree plot")
+
+# The interactive widget cannot be inlined into a self-contained parent
+# document. Link it and be explicit, rather than embedding an iframe that
+# silently breaks the moment the report is copied elsewhere.
+ih <- grep("_expression_pca\\.html$", figs, value = TRUE)
+if (length(ih)) {
+  cat(sprintf("\n[Open the interactive PCA](%s) — separate file, must travel alongside this report.\n\n", ih[1]))
+}
+```
+
+```{r pca_out}
+sc <- read_tbl("_pca_scores\\.tsv$")
+if (!is.null(sc) && "is_outlier" %in% names(sc)) {
+  o <- sc[is_outlier == TRUE]
+  if (nrow(o)) {
+    cat(sprintf("\n**%d expression outlier(s)** (robust distance > 4 MAD on PC1/PC2):\n\n", nrow(o)))
+    print(kable(o[, .(patient_id, PC1, PC2, outlier_score)], digits = 2))
+  }
+}
+```
+
+> Points are coloured by a real covariate, not by a constant. Separation that
+> tracks institution rather than biology is a batch effect and should be
+> resolved before the downstream results are interpreted.
+
+## Fusions
+
+```{r fusions, results='asis'}
+show_fig("_fusions", "Recurrent fusions")
+absent("_fusions", toggle = "run_fusions",
+       data_reason = "No fusion calls were available for this cohort.")
+```
+
+```{r fusion_tbl}
+dt_show(read_tbl("_fusions\\.tsv$"), "Recurrent fusions (DNA+RNA supported flagged)")
+```
+
+## Stratified comparison
+
+```{r comp, results='asis'}
+show_fig("_comparative", "Stratified comparison")
+absent("_comparative", toggle = "run_comparative",
+       data_reason = "Not enough patients per group for a meaningful comparison.")
+```
+
+```{r comp_caveat, results='asis'}
+if (length(grep("_comparative", figs))) {
+  st <- read_tbl("_cnv_stats\\.tsv$")
+  if (!is.null(st) && "gene_selection" %in% names(st)) {
+    cat(sprintf("\n> **Gene selection:** %s\n\n", st$gene_selection[1]))
+  }
+  cat("> Where genes were chosen from this same cohort's mutation frequencies and then tested on it, the p-values are optimistic. Unadjusted tests are labelled as such; institution-adjusted models are reported alongside where the data support them.\n\n")
+  dt_show(st, "Per-gene CNV frequency differences")
+}
+```
+
+## Provenance
+
+```{r prov, results='asis'}
+v <- list.files(params$figdir, pattern = "versions", full.names = TRUE)
+if (length(v)) {
+  cat("```\n")
+  for (f in v) cat(paste(readLines(f, warn = FALSE), collapse = "\n"), "\n")
+  cat("```\n")
+} else cat("_No version files staged._\n")
+```
+
+```{r si}
+sessionInfo()
+```

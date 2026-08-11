@@ -1,0 +1,165 @@
+Bootstrap: docker
+From: rocker/r-ver:4.4.1
+
+# ===========================================================================
+# pipeline.def -- Apptainer image for the MoHQ cohort pipeline
+#
+# Fixes vs the original definition
+# --------------------------------
+# 1. The %environment block was ENTIRELY COMMENTED OUT, so MCR_ROOT and
+#    LD_LIBRARY_PATH were never set and GISTIC could not run at all. It is
+#    restored and active below.
+#
+# 2. `dpendencies=TRUE` -- a typo. install.packages() ignores unknown
+#    arguments silently, so dependencies were never actually forced.
+#
+# 3. `From: ensemblorg/ensembl-vep:latest` pinned nothing. For a multiyear
+#    project, `latest` means a rebuild two years from now silently produces
+#    different results from the same source. Base image and R version are now
+#    pinned, and R packages are installed from a dated Posit Package Manager
+#    snapshot so a rebuild reproduces the same package versions.
+#
+# 4. install.packages() does not set a non-zero exit code when a package fails
+#    to build. The original therefore produced images that looked fine and
+#    failed at runtime. Every install is now followed by an explicit
+#    library() check that aborts the build.
+#
+# 5. data.table was never installed explicitly (it arrived only as a maftools
+#    dependency). It is now a first-class dependency, as is scales.
+#
+# 6. rocker/r-ver is used instead of apt r-base: it gives a pinned R version
+#    and prebuilt binary packages, cutting build time from ~1h to minutes.
+#
+# NOTE ON VEP: the original image was built FROM the VEP image so it could run
+# `vep`. Nothing in the rewritten pipeline calls VEP -- PCGR has already
+# annotated the MAFs you consume. If you do need VEP, run it as a separate
+# process with its own container rather than fusing two large toolchains into
+# one image.
+#
+# Build:  apptainer build pipeline.sif pipeline.def
+# ===========================================================================
+
+%labels
+    Maintainer  mariyana.slavova@computationalgenomics.ca
+    Version     2.0.0
+    R_Version   4.4.1
+    CRAN_Date   2025-01-15
+
+%environment
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+    export MCR_ROOT=/opt/gistic2/MATLAB_Compiler_Runtime/v83
+    export LD_LIBRARY_PATH=$MCR_ROOT/runtime/glnxa64:$MCR_ROOT/bin/glnxa64:$MCR_ROOT/sys/os/glnxa64:$MCR_ROOT/sys/opengl/lib/glnxa64:$LD_LIBRARY_PATH
+    export XAPPLRESDIR=$MCR_ROOT/X11/app-defaults
+    export PATH=/opt/gistic2:$PATH
+    # MCR writes a cache; without this it tries $HOME and fails on read-only
+    # or quota-full home directories. Nextflow overrides this per task.
+    export MCR_CACHE_ROOT=${MCR_CACHE_ROOT:-/tmp/mcr_cache}
+    # GISTIC's MATLAB runtime must not attempt an X connection.
+    unset DISPLAY
+
+%post
+    set -eu
+    export DEBIAN_FRONTEND=noninteractive
+
+    # ---------------------------------------------------------------- #
+    # System libraries
+    # ---------------------------------------------------------------- #
+    apt-get update && apt-get install -y --no-install-recommends \
+        wget unzip tar ca-certificates \
+        libx11-6 libxext6 libxtst6 libxrender1 libxi6 libxt6 libxmu6 \
+        libncurses5 libgl1-mesa-glx \
+        libcurl4-openssl-dev libssl-dev libxml2-dev \
+        fontconfig libfontconfig1-dev libfreetype6-dev \
+        libharfbuzz-dev libfribidi-dev libpng-dev libtiff5-dev libjpeg-dev \
+        libglpk-dev zlib1g-dev libbz2-dev liblzma-dev \
+        pandoc python3 python3-pip \
+        && rm -rf /var/lib/apt/lists/*
+
+    # ---------------------------------------------------------------- #
+    # GISTIC 2.0.23 + MATLAB Compiler Runtime
+    #
+    # The Broad FTP endpoint the original used has been unreliable; if this
+    # download fails, fetch GISTIC_2_0_23.tar.gz manually, place it beside
+    # this .def, and swap the wget for a %files stanza.
+    # ---------------------------------------------------------------- #
+    mkdir -p /opt/gistic2
+    wget --tries=3 --timeout=60 -qO /tmp/gistic2.tar.gz \
+        https://storage.googleapis.com/gistic2/GISTIC_2_0_23.tar.gz \
+        || wget --tries=3 --timeout=60 -qO /tmp/gistic2.tar.gz \
+        ftp://ftp.broadinstitute.org/pub/GISTIC2.0/GISTIC_2_0_23.tar.gz
+    tar -xf /tmp/gistic2.tar.gz -C /opt/gistic2 --strip-components=1
+    rm /tmp/gistic2.tar.gz
+
+    if [ -f /opt/gistic2/MCR_Installer/MCRInstaller.zip ]; then
+        cd /opt/gistic2/MCR_Installer
+        unzip -q MCRInstaller.zip
+        ./install -mode silent -agreeToLicense yes \
+                  -destinationFolder /opt/gistic2/MATLAB_Compiler_Runtime/
+        cd / && rm -rf /opt/gistic2/MCR_Installer
+    else
+        echo "ERROR: MCRInstaller.zip not found in the GISTIC tarball" >&2
+        exit 1
+    fi
+    chmod -R 755 /opt/gistic2
+
+    # Verify the runtime actually links -- this is exactly what the missing
+    # %environment block used to break, silently, until run time.
+    export MCR_ROOT=/opt/gistic2/MATLAB_Compiler_Runtime/v83
+    export LD_LIBRARY_PATH=$MCR_ROOT/runtime/glnxa64:$MCR_ROOT/bin/glnxa64:$MCR_ROOT/sys/os/glnxa64:$LD_LIBRARY_PATH
+    if ! ldd /opt/gistic2/gp_gistic2_from_seg | grep -q 'not found'; then
+        echo "GISTIC binary links cleanly."
+    else
+        echo "ERROR: unresolved libraries for gp_gistic2_from_seg:" >&2
+        ldd /opt/gistic2/gp_gistic2_from_seg | grep 'not found' >&2
+        exit 1
+    fi
+
+    # ---------------------------------------------------------------- #
+    # R packages, from a DATED snapshot for reproducibility.
+    # Change CRAN_SNAPSHOT deliberately, and bump %labels CRAN_Date with it.
+    # ---------------------------------------------------------------- #
+    CRAN_SNAPSHOT="https://packagemanager.posit.co/cran/__linux__/jammy/2025-01-15"
+
+    Rscript -e "options(repos = c(CRAN='${CRAN_SNAPSHOT}'), Ncpus = parallel::detectCores()); \
+        install.packages(c('data.table','dplyr','tidyr','ggplot2','scales', \
+                           'argparse','plotly','htmlwidgets','rmarkdown','knitr', \
+                           'R.utils','BiocManager','DT'))"
+
+    Rscript -e "options(repos = c(CRAN='${CRAN_SNAPSHOT}'), Ncpus = parallel::detectCores()); \
+        BiocManager::install('maftools', ask = FALSE, update = FALSE)"
+
+    # Optional: mutational signatures. Uncomment to enable that analysis.
+    # Rscript -e "BiocManager::install(c('MutationalPatterns', \
+    #     'BSgenome.Hsapiens.UCSC.hg38'), ask = FALSE, update = FALSE)"
+
+    # ---------------------------------------------------------------- #
+    # Fail the BUILD if any package is unusable.
+    # install.packages() exits 0 even when a package fails to compile, which
+    # is how the original produced images that broke only at run time.
+    # ---------------------------------------------------------------- #
+    Rscript -e "pkgs <- c('data.table','dplyr','tidyr','ggplot2','scales','argparse', \
+                          'plotly','htmlwidgets','rmarkdown','knitr','maftools'); \
+        bad <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]; \
+        if (length(bad)) { \
+            cat('FATAL: packages failed to install:', paste(bad, collapse=', '), '\n'); \
+            quit(status = 1) \
+        }; \
+        cat('All R packages verified.\n'); \
+        writeLines(capture.output(sessionInfo()), '/opt/r_session_info.txt')"
+
+%test
+    set -e
+    echo "--- R ---"
+    Rscript -e "cat(R.version.string, '\n')"
+    Rscript -e "library(maftools); library(data.table); library(ggplot2); cat('R OK\n')"
+    echo "--- Python ---"
+    python3 --version
+    echo "--- GISTIC ---"
+    test -x /opt/gistic2/gp_gistic2_from_seg && echo "GISTIC binary present"
+    ldd /opt/gistic2/gp_gistic2_from_seg | grep -q 'not found' \
+        && { echo "GISTIC libraries unresolved"; exit 1; } \
+        || echo "GISTIC libraries OK"
+
+%runscript
+    exec "$@"

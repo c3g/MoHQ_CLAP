@@ -1,0 +1,151 @@
+# ===========================================================================
+# Minimal params: ONE cohort, on Cardinal, cohort plots only.
+#
+#   nextflow run . -profile cardinal -params-file params/cardinal_test.yaml -resume
+#
+# Everything optional is switched OFF. Get this working, then turn extras on
+# one at a time.
+# ===========================================================================
+
+# Paths use /home/mslavova because check_cardinal.sh showed $SCRATCH is not a
+# mounted filesystem on Cardinal (diskusage_report found nothing, df failed).
+# /home has 420 GB free, which is ample: one cohort is roughly 7 GB.
+# If /scratch does turn out to work, move the big directories there.
+
+# --- which cohort ----------------------------------------------------------
+# HM-19: 50 patients harvested and verified.
+#   44/50 analysis-ready (6 excluded for missing cna_segments)
+#   22 with a delivered PCGR VCF, 27 regenerable, 1 with neither
+#   PCGR versions present: 1.0.3 (37) and 1.4.1 (12)
+cohort_dir:  "/home/mslavova/MoHQ/collection/HM/MoHQ-HM-19"
+cohort_name: "MoHQ-HM-19"
+outdir:      "/home/mslavova/MoHQ/results"
+
+# --- container -------------------------------------------------------------
+# Built with: apptainer build --notest pipeline.sif pipeline.def
+# Verified: all 9 R packages load, with and without --cleanenv.
+container: "/home/mslavova/pipeline/pipeline.sif"
+
+# --- REQUIRED for the mutation analyses ------------------------------------
+# The MAFs in the collection have no gene names, so they are rebuilt from the
+# PCGR VCFs.
+#
+# These files were produced by an older GenPipes that did not annotate, so VEP
+# has to be re-run. Set up with:   bash bin/setup_vep.sh --install
+# (long download; run it in tmux or a job, not bare on the login node)
+#
+# Worth 10 seconds before committing to the ~30 GB download: an unannotated MAF
+# does not strictly prove the VCF lacks annotation -- they are written by
+# different steps. If this prints a header line you can set inhibit_vep: true
+# and skip VEP entirely:
+#     zcat <a _D.pcgr_acmg.grch38.vcf.gz> | grep -m1 '^##INFO=<ID=CSQ'
+#
+# CONFIRMED PRESENT: the delivered PCGR VCFs carry a full CSQ INFO field
+# (checked on MoHQ-HM-19-1), so vcf2maf can parse PCGR's own VEP annotation
+# instead of re-running VEP. Seconds per patient instead of tens of minutes,
+# no VEP cache needed, and the gene symbols match the PCGR reports exactly.
+#
+# Set HERE, not in the vcf2maf_host profile: a -params-file overrides params
+# defined in a config profile, so a `false` here silently wins and vcf2maf
+# tries to run VEP with no container around it.
+#
+# NOTE: only the 22 patients with a delivered PCGR VCF have CSQ. The 24 on
+# ensemble VCFs will fail the guard in VCF2MAF -- that is the guard working.
+# Use run_pcgr_gapfill to handle those properly.
+inhibit_vep: true
+
+vcf2maf_path:  "/home/mslavova/tools/vcf2maf/vcf2maf.pl"
+
+# --- VEP 105, matching what PCGR originally used ---------------------------
+# The PCGR VCFs were annotated with VEP v105 (##VEP="v105" in their headers).
+# Using the same release means the gene symbols in our regenerated MAFs match
+# the gene symbols in PCGR's cna_segments files -- which matters because
+# run_oncoprint.R joins those two on gene symbol to build maftools' cnTable.
+# With VEP 115, genes renamed between releases would silently lose their
+# copy-number annotation.
+#
+# This cache is already on CVMFS -- no download, and it is the exact cache PCGR
+# used, not merely the same version number.
+vep_cache:         "/cvmfs/soft.mugqic/CentOS6/genomes/pcgr/20220203/data/grch38/.vep"
+vep_cache_version: "105"
+
+# The container is still release 115. That is FINE for --cache-version 105:
+# VEP reads whichever cache you point it at. But it is worth knowing, and if
+# vcf2maf complains about a version mismatch, pull a matching image:
+#     VEP_RELEASE=105 bash bin/setup_vep.sh --install
+vep_container: "/home/mslavova/MoHQ/VEP/vep_115.sif"
+
+# GRCh38 primary sequence is identical across Ensembl releases, so the FASTA
+# downloaded with the 115 cache is valid here. vcf2maf uses it only for
+# reference-allele checks.
+# If the CVMFS bundle ships its own FASTA, prefer that one -- check with:
+#     ls /cvmfs/soft.mugqic/CentOS6/genomes/pcgr/20220203/data/grch38/.vep/homo_sapiens/105_GRCh38/*.fa.gz
+ref_fasta: "/home/mslavova/MoHQ/VEP/vep_data/homo_sapiens/115_GRCh38/Homo_sapiens.GRCh38.dna.toplevel.fa.gz"
+
+# Leave vep_path unset: VCF2MAF runs inside vep_container, where vep is already
+# on PATH. Setting both would nest apptainer inside apptainer.
+# vep_path: "/home/mslavova/MoHQ/VEP/bin"
+
+# Converted MAFs: the expensive VEP output. Keep off any purged filesystem.
+derived_maf_dir: "/home/mslavova/MoHQ/derived_mafs"
+
+# --- ON: the plots ----------------------------------------------------------
+run_oncoprint:         true
+run_cnv_frequency:     true
+run_cnv_burden:        true
+run_pca:               true
+run_fusions:           true
+run_completeness_plot: true    # which patients are missing which files
+run_report:            true
+
+# --- OFF for now, but ONLY because one cohort isn't enough ------------------
+#
+# run_collection turns on BOTH the all-cohorts rollup AND the batch-effect
+# analysis. Both compare cohorts against each other, so with a single cohort
+# there is literally nothing to compare -- it is arithmetic, not preference.
+#
+# The batch-effect analysis specifically needs a cancer type present at TWO OR
+# MORE institutions. Holding cancer type constant and varying institution is
+# what isolates the technical effect. With one cohort (one cancer type, one
+# institution) that contrast does not exist.
+#
+# TURN THIS ON once you have harvested at least two cohorts of the same cancer
+# type from different institutions, and written cohort_map.tsv:
+#
+#   run_collection: true
+#   cohort_map: "assets/cohort_map.tsv"
+#   input: "samplesheet.csv"        # replaces cohort_dir/cohort_name
+#
+run_collection:        false
+# cohort_map:          "assets/cohort_map.tsv"
+run_comparative:       false   # needs a GTF + clinical metadata
+run_gistic:            false   # needs the GISTIC refgene .mat
+
+# --- analysis settings ------------------------------------------------------
+amp_threshold: 0.58
+del_threshold: -0.58
+
+# Callable territory for TMB. Your BAMs (90-250 GB) look like WGS, so 2800.
+# If this is exome data instead, use 30 -- otherwise TMB is ~90x wrong.
+#
+# CORRECTED. This was 2800, and that was wrong.
+#
+# The denominator must match what the NUMERATOR counts. run_oncoprint.R counts
+# NON-SYNONYMOUS (coding) variants, so the denominator is the CODING footprint
+# (~30-40 Mb) -- even though this is whole-genome sequencing.
+#
+# With 2800 the first real run reported 0.01-0.05 mutations/Mb. The same
+# variants over 30 Mb give 0.9-4.7/Mb, which is a plausible range.
+# Use ~2800 only if you switch to counting non-coding variants as well.
+callable_mb: 30
+
+pca_norm_method: "log2"
+pca_colour_by: "institution"
+
+# --- cluster ----------------------------------------------------------------
+# Account and partitions are set in the `cardinal` profile in nextflow.config
+# (account def-c3g, partition cpubase_bycore_b1, high-memory tasks to cnode-hm-).
+# Nothing to set here unless you want different caps.
+max_memory: "120.GB"     # raise once you know the node sizes
+max_cpus: 16
+max_time: "24.h"

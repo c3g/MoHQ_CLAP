@@ -1,0 +1,105 @@
+# ===========================================================================
+# .gitignore -- MoHQ cohort pipeline
+#
+# Two rules behind everything here:
+#
+#   1. NO PATIENT DATA, EVER. This is controlled-access human genomic data.
+#      Git makes mistakes permanent: a file committed once stays in the
+#      history even after it is deleted, and `git push` sends the whole
+#      history. Removing it afterwards means rewriting history and
+#      force-pushing, which is disruptive at best.
+#
+#   2. Nothing regenerable. Results, rendered reports and container images are
+#      outputs of the code in this repo. Committing them bloats the history
+#      (a rendered HTML report is >1 MB and changes completely on every knit)
+#      and invites the question of which version is authoritative -- the file
+#      or the code that made it.
+# ===========================================================================
+
+# --- Pipeline execution ---------------------------------------------------
+work/
+results/
+.nextflow/
+.nextflow.log*
+.nextflow.history*
+timeline.html
+report.html
+trace.txt
+dag.*
+
+# --- PATIENT DATA. Do not relax these without asking the data steward. -----
+# Persistent published artefacts. Every one contains variant-level data.
+derived_mafs/
+regenerated_pcgr/
+filtered_ensemble/
+collection/
+
+# Manifests, completeness tables and audits: one row per patient, with
+# absolute paths into the delivery tree.
+audit/
+.manifest_cache/
+*.manifest.tsv
+*.completeness.tsv
+*.samples.tsv
+*.ambiguities.tsv
+mutation_provenance.tsv
+# Audit outputs. Named for what they check, not for what they contain, which
+# is why an earlier version of this file missed build_audit.tsv -- it matched
+# none of the patterns above and was committed.
+*audit*.tsv
+*audit*.csv
+build_audit.tsv
+maf_annotation_audit.txt
+
+# Raw data formats, wherever they land.
+*.vcf
+*.vcf.gz
+*.vcf.gz.tbi
+*.tbi
+*.maf
+*.bam
+*.bai
+*.cram
+*.seg
+*.cna_segments.tsv.gz
+
+# The completeness inventory exports.
+completeness*.csv
+*completeness_live*.csv
+
+# --- Regenerable outputs --------------------------------------------------
+# Rendered reports. Keep the .Rmd; anyone can knit it.
+reports/*.html
+README.html
+*_report.html
+*_files/
+*_cache/
+
+# Container images -- hundreds of MB. Build from pipeline.def.
+*.sif
+*.simg
+
+# --- Personal helpers, not part of the pipeline ---------------------------
+bin/check_before_commit.sh
+
+# --- Local noise ----------------------------------------------------------
+.DS_Store
+__pycache__/
+*.pyc
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+*.swp
+*~
+*.new
+*.orig
+*.bak
+
+# --- Deliberately NOT ignored, for the record -----------------------------
+# docs/*.svg, docs/*.png   -- the pipeline and completeness figures. Generated,
+#                             but by scripts kept alongside them, small, and
+#                             the thing people actually look at first.
+# assets/*.tsv, *.csv      -- example samplesheet and cohort map. Synthetic.
+# params/*.yaml            -- run configuration. Contains cluster paths but no
+#                             patient data.
