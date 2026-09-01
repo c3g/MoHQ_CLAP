@@ -299,6 +299,65 @@ expand_segments_to_bins <- function(seg, bin_size = 1e6, max_rows = 5e7) {
 #' can span megabases. Either way the gene-level CNV calls were not measuring
 #' the gene. Real annotation is required -- there is no safe fallback, so this
 #' function errors rather than degrading silently.
+#' Coding-sequence length per gene, in kb, from a GTF.
+#'
+#' WHY THIS EXISTS
+#' ---------------
+#' Ranking genes by mutation COUNT rewards long genes: a bigger coding sequence
+#' is a bigger target for passenger mutations, so RP1, LRP2 and ADGRV1 outrank
+#' BRAF on frequency alone. Blocklisting the offenders does not converge --
+#' there are ~1,000 human genes over 3,000 codons and each filtering pass just
+#' reveals the next tier.
+#'
+#' Dividing by coding length removes the bias at its source. It is the cheap
+#' version of what dNdScv and MutSigCV do properly (they also model sequence
+#' context and mutational signatures); this accounts for target size only, and
+#' should be described that way.
+#'
+#' MEASURED ON MoHQ-CM-6, AND IT IS THE WEAKER OF THE TWO CORRECTIONS.
+#' It trades long-gene bias for SHORT-gene bias. MUC19 rose from frequency rank
+#' 4 to normalised rank 3, because its annotated CDS is 3.4 kb while its real
+#' content is a large repeat array the annotation does not represent; the rest
+#' of the normalised top is KRTAP tandem arrays, PRB proline-rich repeats and
+#' HLA-B, all hyperpolymorphic or repetitive. It did recover NRAS at rank 5.
+#'
+#' On the same cohort, positional clustering (oncodrive, run on the same
+#' unfiltered variants) put BRAF at FDR 0.0065 and every mucin at FDR ~0.95.
+#' Prefer clustering where an amino-acid column exists; treat this as the
+#' fallback for MAFs that lack one.
+#'
+#' CDS features, not gene span: the span is mostly intron, which is not the
+#' target for non-synonymous coding variants. Overlapping CDS entries from
+#' alternative transcripts are collapsed so a gene with many isoforms is not
+#' credited with the same base twice.
+cds_length_kb <- function(path) {
+  if (is.null(path) || !nzchar(path) || !file.exists(path)) return(NULL)
+  g <- fread(path, sep = "\t", header = FALSE, quote = "", skip = "\t",
+             col.names = c("chr", "src", "feature", "start", "end",
+                           "score", "strand", "frame", "attr"))
+  g <- g[feature == "CDS"]
+  if (!nrow(g)) {
+    mohq_warn("No CDS features in ", basename(path),
+              " -- cannot compute coding lengths.")
+    return(NULL)
+  }
+  g[, gene := sub('.*gene_name "([^"]+)".*', "\\1", attr)]
+  g <- g[grepl("gene_name", attr) & nzchar(gene), .(gene, start, end)]
+
+  # Collapse overlapping CDS intervals per gene, then sum. Without this, a gene
+  # with ten transcripts sharing an exon counts that exon ten times and looks
+  # ten times longer than it is.
+  setorder(g, gene, start)
+  g[, grp := cumsum(c(TRUE, start[-1] > cummax(end)[-.N])), by = gene]
+  merged <- g[, .(len = max(end) - min(start) + 1), by = .(gene, grp)]
+  out <- merged[, .(cds_kb = sum(len) / 1000), by = gene]
+
+  mohq_log(sprintf("Coding lengths for %s genes from %s (median %.1f kb)",
+                   format(nrow(out), big.mark = ","), basename(path),
+                   median(out$cds_kb)))
+  out[]
+}
+
 load_gene_coords <- function(path) {
   if (is.null(path) || is.na(path) || !nzchar(path) || !file.exists(path)) {
     mohq_die("A gene annotation file is required (--gtf). Supply the same GRCh38 ",
@@ -437,8 +496,31 @@ FLAGS_PATTERNS <- c(
   "^LILR[AB][0-9]",        # LILR cluster
   "^MUC[0-9]",             # mucins
   "^HLA-",                 # HLA: high polymorphism causes systematic miscalls
-  "^IG[HKL][VDJC]",        # immunoglobulin loci -- somatically rearranged
+  # Immunoglobulin loci -- somatically rearranged, so "mutations" here are
+  # often V(D)J recombination or somatic hypermutation, not somatic variants.
+  #
+  # The pattern was ^IG[HKL][VDJC], which requires V/D/J/C in third position.
+  # That matches IGHV3-23 but NOT the CONSTANT-region genes -- IGHG1, IGHA1,
+  # IGHM, IGHD, IGHE -- which is why IGHG1 sat at 18% in MoHQ-HM-19's oncoplot.
+  # [GAME] adds them. IGHMBP2 is a real disease gene (SMARD1) and is spared,
+  # because the digit-or-end anchor stops the match running into it.
+  #
+  # BOTH patterns are needed. The anchored one below cannot replace the
+  # original: ^IG[HKL][VDJC] is open-ended and matches IGHV3-23, which the
+  # anchored form rejects. Swapping one for the other silently un-flagged
+  # every V/D/J segment gene.
+  "^IG[HKL][VDJC]",
+  "^IG[HKL][VDJCGAME][0-9]*$",
   "^TR[ABGD][VDJC]",       # T-cell receptor loci -- likewise
+  # Segmental-duplication families seen topping MoHQ-HM-19's ranking after the
+  # first FLAGS pass. Each has near-identical paralogs, so reads multi-map and
+  # the caller emits recurrent false positives.
+  "^AGAP[0-9]",            # AGAP4/AGAP9 etc, chr10 duplications
+  "^RGPD[0-9]",            # RANBP2-like family
+  "^SPDYE",                # speedy/RINGO family
+  "^FRG1",                 # FRG1 with FRG1BP/FRG1HP paralogs
+  "^POM121",               # POM121 / POM121C
+  "^FBXW10",
   "^PRAMEF",
   "^KRTAP",                # keratin-associated, tandem arrays
   "^ZNF7[0-9][0-9]",       # some large ZNF clusters
@@ -446,6 +528,15 @@ FLAGS_PATTERNS <- c(
   "^NUTM2",
   "-AS[0-9]$", "^LINC[0-9]", "^LOC[0-9]"   # non-coding / provisional symbols
 )
+
+# Individual genes with no family to match on, each a documented mapping or
+# polymorphism problem rather than a recurrently mutated driver:
+#   KCNJ18  -- near-identical to KCNJ12 in a segmental duplication
+#   PRDM9   -- minisatellite-encoded zinc-finger array, hypervariable by design
+#   IGFN1   -- ~74 kb of internal repeats, a canonical FLAGS-type gene
+# Kept separate from the patterns so each can be reverted on its own evidence.
+FLAGS_GENES_EXTRA <- c("KCNJ18", "PRDM9", "IGFN1")
+FLAGS_GENES <- union(FLAGS_GENES, FLAGS_GENES_EXTRA)
 
 #' Drop artefact-prone genes, by explicit symbol AND by family pattern.
 #'

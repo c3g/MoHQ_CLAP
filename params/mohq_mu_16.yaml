@@ -1,0 +1,110 @@
+# ===========================================================================
+# MoHQ-MU-16 -- one cohort on Cardinal.
+#
+#   nextflow run . -profile cardinal,vcf2maf_host \
+#       -params-file params/mohq_mu_16.yaml \
+#       -c conf/overnight.config \
+#       --run_pcgr_gapfill true -resume
+#
+# Copied from params/cardinal_test.yaml (MoHQ-HM-19). Everything that is a
+# property of the CLUSTER is unchanged; everything that is a property of the
+# COHORT is marked TO CONFIRM below, because assuming one cohort behaves like
+# another is exactly how the PCGR input error happened.
+# ===========================================================================
+
+# --- which cohort ----------------------------------------------------------
+# TO FILL IN after the first run: patients harvested, analysis-ready, delivered
+# vs regenerable PCGR VCFs, and which PCGR versions appear. Read them from
+#   results/MoHQ-MU-16/manifest/MoHQ-MU-16.manifest.tsv
+cohort_dir:  "/home/mslavova/MoHQ/collection/MU/MoHQ-MU-16"
+cohort_name: "MoHQ-MU-16"
+outdir:      "/home/mslavova/MoHQ/results"
+
+container: "/home/mslavova/pipeline/pipeline.sif"
+
+# --- PCGR VCFs delivered outside the patient folders ------------------------
+# MoHQ-MU-16 ships a batch directory holding 53 PCGR VCFs named
+# <patient_id>.pcgr_acmg.grch38.vcf.gz (no _D suffix, so none of the in-patient
+# patterns match them). For 35 patients it is the ONLY delivered PCGR VCF.
+#
+# It matters more than the count suggests: 32 of those 35 are recorded against
+# mugqic/pcgr/0.9.2, which is installed on Cardinal but provides no `pcgr`
+# executable. Using the delivered files means none of them need rebuilding with
+# a different PCGR version -- no substitution, no technical confound.
+#
+# Effect on this cohort: 51 delivered in-patient + 35 from here = 86 delivered,
+# 15 to regenerate (all on 1.0.3, which works), 1 with nothing.
+external_pcgr_dir: "20231122_vepvcfs"
+
+# --- MUTATION SOURCE -- THE ONE SETTING TO VERIFY BEFORE RUNNING -----------
+#
+# inhibit_vep: true tells vcf2maf to read the CSQ annotation PCGR already
+# wrote, instead of re-running VEP. Seconds per patient rather than minutes,
+# and the gene symbols match PCGR's own reports.
+#
+# It is only valid if MU-16's delivered PCGR VCFs actually carry CSQ. That was
+# confirmed for HM-19; it is NOT automatically true here, because cohorts were
+# processed by different GenPipes vintages. Check before running:
+#
+#   zcat /home/mslavova/MoHQ/collection/MU/MoHQ-MU-16/*/reports/pcgr/*_D.pcgr_acmg.grch38.vcf.gz \
+#     | grep -m1 '^##INFO=<ID=CSQ' && echo "CSQ present -- keep true" \
+#     || echo "NO CSQ -- set inhibit_vep: false and supply a VEP cache"
+#
+# If it comes back with no CSQ, VCF2MAF fails loudly rather than producing an
+# unannotated MAF. That is the guard working, not a bug.
+inhibit_vep: true
+
+vcf2maf_path: "/home/mslavova/tools/vcf2maf/vcf2maf.pl"
+
+vep_cache:         "/cvmfs/soft.mugqic/CentOS6/genomes/pcgr/20220203/data/grch38/.vep"
+vep_cache_version: "105"
+vep_container:     "/home/mslavova/MoHQ/VEP/vep_115.sif"
+ref_fasta: "/home/mslavova/MoHQ/VEP/vep_data/homo_sapiens/115_GRCh38/Homo_sapiens.GRCh38.dna.toplevel.fa.gz"
+
+derived_maf_dir: "/home/mslavova/MoHQ/derived_mafs"
+
+# --- analyses ---------------------------------------------------------------
+run_oncoprint:         true
+run_cnv_frequency:     true
+run_cnv_burden:        true
+run_pca:               true
+run_fusions:           true
+run_completeness_plot: true
+run_report:            true
+
+run_collection:        false   # needs several cohorts + cohort_map.tsv
+run_comparative:       false   # needs a GTF + clinical metadata
+run_gistic:            false   # needs the GISTIC refgene .mat
+
+# --- analysis settings ------------------------------------------------------
+amp_threshold: 0.58
+del_threshold: -0.58
+
+# Coding footprint, because run_oncoprint.R counts NON-SYNONYMOUS variants.
+# The denominator must match what the numerator counts -- 2800 (whole genome)
+# would understate TMB by ~90x. PCGR's own log for this collection reports a
+# coding target size of 34 Mb, which is the check on this number.
+callable_mb: 30
+
+pca_norm_method: "log2"
+
+# institution is CONSTANT within a single cohort, so colouring by it gives one
+# colour and tells you nothing. Use a variable that actually varies here.
+# run_pca.R falls back to cohort_id with a warning if the column is absent.
+# Candidates present in the manifest: pcgr_version, genome_build,
+# pcgr_vcf_status, multi_tumour.
+pca_colour_by: "pcgr_vcf_status"
+
+# --- gap-fill ---------------------------------------------------------------
+# Leave commented until the manifest shows how many patients need it and which
+# PCGR versions they used. Then pass on the command line rather than here, so
+# the choice is visible in the run record:
+#     --run_pcgr_gapfill true --pcgr_module_fallback mugqic/pcgr/1.0.3
+#
+# pcgr_module_fallback applies ONLY to patients whose own version could not be
+# read from a GenPipes ini. Everyone else keeps their recorded version.
+
+# --- cluster ----------------------------------------------------------------
+max_memory: "120.GB"
+max_cpus: 16
+max_time: "24.h"

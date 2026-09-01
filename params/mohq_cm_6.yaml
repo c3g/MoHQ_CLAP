@@ -1,0 +1,118 @@
+# ===========================================================================
+# MoHQ-CM-6 -- Melanoma (PCGR code 24 = Skin), 39 patients.
+#
+#   nextflow run . -profile cardinal,vcf2maf_host \
+#       -params-file params/mohq_cm_6.yaml \
+#       -c conf/overnight.config \
+#       --run_pcgr_gapfill true -resume
+#
+# Copied from params/mohq_mu_16.yaml. Cluster settings unchanged; everything
+# that is a property of THIS COHORT is marked TO CHECK, because assuming one
+# cohort behaves like another is how the PCGR input error happened.
+# ===========================================================================
+
+# --- which cohort ----------------------------------------------------------
+# From the harvest receipt: 39 patients, 668 objects, 12.2 GB.
+#   25/39 have a delivered PCGR VCF   -> 14 need gap-fill
+#   37/39 have a CNVkit VCF           -> 2 will fail the analysis-ready gate
+#   39/39 have expression             -> PCA has full input
+#   34-35/39 have fusion calls
+cohort_dir:  "/home/mslavova/MoHQ/collection/CM/MoHQ-CM-6"
+cohort_name: "MoHQ-CM-6"
+outdir:      "/home/mslavova/MoHQ/results"
+
+container: "/home/mslavova/pipeline/pipeline.sif"
+
+# --- TO CHECK 1: is there a batch directory of PCGR VCFs? ------------------
+# MoHQ-MU-16 shipped 35 of its PCGR VCFs in a dated folder beside the patient
+# directories, not inside them. If CM-6 does the same, some of the 14 patients
+# that look regenerable are actually delivered, and re-running PCGR for them
+# would be work you do not need and a version difference you do not want.
+#
+#   ls ~/MoHQ/collection/CM/MoHQ-CM-6/ | grep -v '^MoHQ-CM-6-'
+#
+# If that prints a directory of *.vcf.gz, uncomment and point at it:
+# external_pcgr_dir: "/home/mslavova/MoHQ/collection/CM/MoHQ-CM-6/<dirname>"
+
+# --- TO CHECK 2: do the delivered PCGR VCFs carry CSQ? --------------------
+# inhibit_vep reuses PCGR's own VEP annotation instead of re-running VEP.
+# Confirmed for HM-19 and MU-16; NOT automatically true here. Check before
+# running (the data is local, so this is seconds):
+#
+#   cd ~/MoHQ/collection/CM/MoHQ-CM-6
+#   for f in */reports/pcgr/*_D*.vcf.gz; do
+#     zcat "$f" 2>/dev/null | awk '/^##INFO=<ID=CSQ/{print "CSQ  '"$f"'";f=1;exit}
+#                                  /^#CHROM/{exit} END{if(!f)print "NONE '"$f"'"}'
+#   done | awk '{print $1}' | sort | uniq -c
+#
+# All CSQ -> keep true. Any NONE -> set false and supply the VEP cache, so
+# every patient is annotated the same way.
+inhibit_vep: true
+
+vcf2maf_path: "/home/mslavova/tools/vcf2maf/vcf2maf.pl"
+
+vep_cache:         "/cvmfs/soft.mugqic/CentOS6/genomes/pcgr/20220203/data/grch38/.vep"
+vep_cache_version: "105"
+vep_container:     "/home/mslavova/MoHQ/VEP/vep_115.sif"
+ref_fasta: "/home/mslavova/MoHQ/VEP/vep_data/homo_sapiens/115_GRCh38/Homo_sapiens.GRCh38.dna.toplevel.fa.gz"
+
+derived_maf_dir: "/home/mslavova/MoHQ/derived_mafs"
+
+# --- analyses ---------------------------------------------------------------
+run_oncoprint:         true
+run_cnv_frequency:     true
+run_cnv_burden:        true
+run_pca:               true
+run_fusions:           true
+run_completeness_plot: true
+run_report:            true
+
+run_collection:        false   # single cohort
+run_gistic:            false   # needs the GISTIC refgene .mat
+
+# --- stratified comparison --------------------------------------------------
+# The sex table covers every cohort, so this works here. Melanoma is
+# male-skewed; check both groups clear comparative_min_group_n before relying
+# on the output -- the script writes a labelled placeholder rather than an
+# underpowered figure, which is the answer, not a failure.
+#
+# Needs a GTF. Set the path and flip run_comparative to true:
+run_comparative: true
+gtf: "/cvmfs/soft.mugqic/CentOS6/genomes/species/Homo_sapiens.GRCh38/annotations/Homo_sapiens.GRCh38.Ensembl104.gtf"
+extra_metadata:          "/home/mslavova/MoHQ/metadata/mohq_sex.tsv"
+comparative_group_col:   "Sex"          # capital S -- match the file's header
+comparative_min_group_n: 5
+# gtf: "/cvmfs/soft.mugqic/CentOS6/genomes/species/Homo_sapiens.GRCh38/annotations/Homo_sapiens.GRCh38.Ensembl104.gtf"
+
+# --- analysis settings ------------------------------------------------------
+amp_threshold: 0.58
+del_threshold: -0.58
+
+# Coding footprint, because run_oncoprint.R counts NON-SYNONYMOUS variants.
+# The denominator must match what the numerator counts.
+#
+# MELANOMA IS THE COHORT WHERE THIS SHOWS. UV damage gives melanoma one of the
+# highest mutation burdens of any tumour type, with a characteristic C>T at
+# dipyrimidines. Expect TMB well above the ~20/Mb seen in HM-19 and MU-16, and
+# expect the substitution spectrum under the oncoplot to be dominated by C>T.
+# That is biology here, not a processing artefact -- but it is worth saying so
+# explicitly, because a high number in an unfamiliar cohort usually is one.
+callable_mb: 30
+
+pca_norm_method: "log2"
+
+# institution is CONSTANT within one cohort, so colouring by it gives one
+# colour. pcgr_version varies across processing rounds and is the technical
+# variable worth seeing.
+pca_colour_by: "pcgr_version"
+
+# --- completeness heatmap ---------------------------------------------------
+# Assets absent for EVERY patient are excluded from the tiles and listed in a
+# table instead. With `core` harvested, ~24 asset types are never present and
+# would otherwise fill a third of the grid.
+completeness_drop_never_present: true
+
+# --- cluster ----------------------------------------------------------------
+max_memory: "120.GB"
+max_cpus: 16
+max_time: "24.h"

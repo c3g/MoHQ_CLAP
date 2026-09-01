@@ -21,6 +21,12 @@ parser$add_argument("--manifest", required = TRUE)
 parser$add_argument("--cohort", default = "MoHQ")
 parser$add_argument("--max_tile_rows", type = "integer", default = 150,
                     help = "Above this many patients, aggregate the heatmap to cohort level")
+parser$add_argument("--drop_never_present", type = "logical", default = TRUE,
+                    help = paste("Exclude assets absent for EVERY patient from the",
+                                 "heatmap and list them in a table instead. These are",
+                                 "almost always a harvest-scope choice rather than a",
+                                 "per-patient gap, and they crowd out the variation",
+                                 "the grid exists to show. (default TRUE)"))
 parser$add_argument("--out_prefix", default = "completeness")
 args <- parser$parse_args()
 
@@ -80,12 +86,39 @@ long[, state := fifelse(asset %in% never_present, "absent for all",
                 fifelse(present, "present", "missing"))]
 if (length(never_present)) {
   mohq_log(sprintf(paste0("%d asset(s) are absent for EVERY patient: %s.\n",
-                          "  These are shown separately. Most likely they were not ",
-                          "harvested (see harvest_juno.py --sets) rather than missing ",
-                          "from the delivery. Confirm against the object store before ",
-                          "reporting them as gaps."),
+                          "  Most likely they were not harvested (see harvest_juno.py ",
+                          "--sets) rather than missing from the delivery. Confirm ",
+                          "against the object store before reporting them as gaps."),
                    length(never_present),
                    paste(utils::head(as.character(never_present), 10), collapse = ", ")))
+}
+
+# --------------------------------------------------------------------------- #
+# DROP THE NEVER-PRESENT ASSETS FROM THE TILES.
+#
+# Giving them their own colour made them interpretable but not readable: with
+# ~24 of ~60 assets never harvested, a third of the grid is a solid block that
+# carries one bit of information ("we did not fetch these") and crowds out the
+# per-patient variation the figure exists to show.
+#
+# So they come out of the plot and go into a table instead -- same information,
+# proportionate space. The heatmap is then about what differs BETWEEN patients,
+# which is the only thing a per-patient grid can tell you.
+#
+# --drop_never_present false restores the old behaviour, for the case where you
+# genuinely want to see the full expected asset list.
+# --------------------------------------------------------------------------- #
+if (isTRUE(args$drop_never_present) && length(never_present)) {
+  fwrite(by_asset[n_present == 0, .(asset, n_present, n_total, pct)],
+         paste0(args$out_prefix, "_assets_never_present.tsv"), sep = "\t")
+  long      <- long[!asset %in% never_present]
+  by_asset  <- by_asset[n_present > 0]
+  asset_cols <- setdiff(asset_cols, as.character(never_present))
+  mohq_log(sprintf("Heatmap shows %d asset(s) with at least one patient; %d never-present asset(s) listed in %s_assets_never_present.tsv",
+                   length(asset_cols), length(never_present), args$out_prefix))
+  if (!nrow(long))
+    mohq_die("Every asset is absent for every patient -- nothing to plot. ",
+             "Check the harvest before interpreting this cohort.")
 }
 
 long[, asset := factor(asset, levels = by_asset$asset)]

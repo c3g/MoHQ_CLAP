@@ -14,7 +14,11 @@ process BUILD_MANIFEST {
     tag   { cohort_id }
     label 'process_single'
 
-    publishDir "${params.outdir}/${cohort_id}/manifest", mode: 'copy'
+    // enabled: !workflow.stubRun -- a -stub-run writes placeholder files;
+    // publishing them overwrites real results. A stub manifest (2 fake
+    // patients) replaced MoHQ-MU-16's real 102-patient manifest this way,
+    // and the preflight then validated the cohort against it.
+    publishDir "${params.outdir}/${cohort_id}/manifest", mode: 'copy', enabled: !workflow.stubRun
 
     input:
     tuple val(cohort_id), path(cohort_dir)
@@ -38,6 +42,20 @@ process BUILD_MANIFEST {
     def cache_arg = params.use_manifest_cache
         ? "--cache ${params.manifest_cache_dir}/${cohort_id}.json"
         : ''
+
+    // PCGR VCFs delivered outside the patient folders (see nextflow.config).
+    // A RELATIVE value resolves inside the staged cohort directory, which is
+    // where such batch directories live -- MoHQ-MU-16/20231122_vepvcfs. An
+    // absolute path is passed through untouched, for a batch kept elsewhere.
+    //
+    // Nextflow stages cohort_dir as a whole, so the batch directory comes with
+    // it and needs no separate input channel.
+    def ext_arg = ''
+    if (params.external_pcgr_dir) {
+        def p = params.external_pcgr_dir.toString()
+        ext_arg = p.startsWith('/') ? "--external-pcgr-dir ${p}"
+                                    : "--external-pcgr-dir ${cohort_dir}/${p}"
+    }
     """
     # Drop the MATLAB Compiler Runtime from the library path.
     #
@@ -60,7 +78,7 @@ process BUILD_MANIFEST {
         --root      ${cohort_dir} \\
         --cohort-id ${cohort_id} \\
         --outdir    . \\
-        --prefix    ${cohort_id} ${cache_arg}
+        --prefix    ${cohort_id} ${cache_arg} ${ext_arg}
 
     cat <<-END_VERSIONS > versions.yml
     "${task.process}":
@@ -114,7 +132,11 @@ process MERGE_METADATA {
     tag   { cohort_id }
     label 'process_single'
 
-    publishDir "${params.outdir}/${cohort_id}/manifest", mode: 'copy'
+    // enabled: !workflow.stubRun -- a -stub-run writes placeholder files;
+    // publishing them overwrites real results. A stub manifest (2 fake
+    // patients) replaced MoHQ-MU-16's real 102-patient manifest this way,
+    // and the preflight then validated the cohort against it.
+    publishDir "${params.outdir}/${cohort_id}/manifest", mode: 'copy', enabled: !workflow.stubRun
 
     input:
     tuple val(cohort_id), path(manifest), path(extra_meta)
@@ -168,7 +190,11 @@ process BUILD_COHORT_SEG {
     tag   { cohort_id }
     label 'process_medium'
 
-    publishDir "${params.outdir}/${cohort_id}/cnv", mode: 'copy'
+    // enabled: !workflow.stubRun -- a -stub-run writes placeholder files;
+    // publishing them overwrites real results. A stub manifest (2 fake
+    // patients) replaced MoHQ-MU-16's real 102-patient manifest this way,
+    // and the preflight then validated the cohort against it.
+    publishDir "${params.outdir}/${cohort_id}/cnv", mode: 'copy', enabled: !workflow.stubRun
 
     input:
     tuple val(cohort_id), path(manifest), path(vcfs)
@@ -200,7 +226,11 @@ process PLOT_COMPLETENESS {
     tag   { cohort_id }
     label 'process_single'
 
-    publishDir "${params.outdir}/${cohort_id}/completeness", mode: 'copy'
+    // enabled: !workflow.stubRun -- a -stub-run writes placeholder files;
+    // publishing them overwrites real results. A stub manifest (2 fake
+    // patients) replaced MoHQ-MU-16's real 102-patient manifest this way,
+    // and the preflight then validated the cohort against it.
+    publishDir "${params.outdir}/${cohort_id}/completeness", mode: 'copy', enabled: !workflow.stubRun
 
     input:
     tuple val(cohort_id), path(completeness), path(manifest)
@@ -219,6 +249,7 @@ process PLOT_COMPLETENESS {
         --manifest      ${manifest} \\
         --cohort        ${cohort_id} \\
         --max_tile_rows ${params.completeness_max_tile_rows} \\
+        --drop_never_present ${params.completeness_drop_never_present} \\
         --out_prefix    ${cohort_id}_completeness
     """
 

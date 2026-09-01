@@ -57,10 +57,14 @@ parser$add_argument("--group_col", default = "sex",
 parser$add_argument("--genes", default = "",
                     help = "Comma/space separated gene list. Empty = top --n_genes by mutation frequency.")
 parser$add_argument("--n_genes", type = "integer", default = 20)
+parser$add_argument("--exclude_flags", type = "logical", default = TRUE,
+                    help = "Drop FLAGS artefact-prone genes before selecting genes (default TRUE)")
 parser$add_argument("--cohort", default = "MoHQ Cohort")
 parser$add_argument("--amp", type = "double", default = 0.58)
 parser$add_argument("--del", type = "double", default = -0.58)
 parser$add_argument("--min_group_n", type = "integer", default = 5)
+parser$add_argument("--min_profiled_mb", type = "double", default = 1000,
+                    help = "Autosomal Mb a sample must be profiled over to be comparable")
 parser$add_argument("--include_sex_chr", action = "store_true")
 parser$add_argument("--out_prefix", default = "comparative")
 args <- parser$parse_args()
@@ -71,11 +75,34 @@ manifest <- read_manifest(args$manifest)
 # --------------------------------------------------------------------------- #
 # 0. Stratification variable
 # --------------------------------------------------------------------------- #
+# CASE-INSENSITIVE RESOLUTION.
+#
+# The stratification column comes from a hand-made metadata file, so its
+# capitalisation is the author's choice, not the pipeline's. A file with a `Sex`
+# header and --group_col sex used to die with "Manifest has no column 'sex'" --
+# while listing `Sex` among the 65 available columns, where nobody could see it.
+#
+# Resolve case-insensitively and say so, rather than making the caller match
+# capitalisation they did not choose.
 if (!args$group_col %in% names(manifest)) {
-  mohq_die("Manifest has no column '", args$group_col, "'. Available: ",
-           paste(names(manifest), collapse = ", "),
-           "\nAdd it to the manifest (see --extra_metadata in the pipeline), ",
-           "or infer sex from the BAMs with somalier rather than a hand-made map.")
+  hit <- names(manifest)[tolower(names(manifest)) == tolower(args$group_col)]
+  if (length(hit) == 1) {
+    mohq_log(sprintf("Column '%s' not found; using '%s' (case-insensitive match).",
+                     args$group_col, hit))
+    args$group_col <- hit
+  } else {
+    # Put plausible columns FIRST. The old message pasted all 65 names in one
+    # line, so the answer was present but truncated off the end of the terminal.
+    near <- grep(substr(args$group_col, 1, 3), names(manifest),
+                 ignore.case = TRUE, value = TRUE)
+    mohq_die("Manifest has no column '", args$group_col, "'.",
+             if (length(near))
+               paste0("\nClosest matches: ", paste(near, collapse = ", "))
+             else "",
+             "\nAll columns:\n  ", paste(names(manifest), collapse = "\n  "),
+             "\nAdd it to the manifest (see --extra_metadata in the pipeline), ",
+             "or infer sex from the BAMs with somalier rather than a hand-made map.")
+  }
 }
 grp <- manifest[, .(patient_id, group = as.character(get(args$group_col)))]
 grp <- grp[!is.na(group) & nzchar(group) & !group %in% c("NA", "unknown", "Unknown")]
@@ -112,6 +139,33 @@ mohq_log("Comparing ", two[1], " vs ", two[2])
 maf_dt <- load_somatic_mafs(args$mafs, manifest = manifest, nonsyn_only = TRUE)
 maf_dt <- merge(maf_dt, grp, by = "patient_id")
 if (!nrow(maf_dt)) mohq_die("No MAF variants left after joining the group column.")
+
+# FLAGS FILTER -- the same one run_oncoprint.R applies.
+#
+# This script had none, and it selects genes by pooled mutation frequency, so
+# it selected exactly what that ranking returns without a filter: on
+# MoHQ-HM-19 all 20 chosen genes were mucins, FLG, HRNR, AHNAK2, EPPK1 and the
+# WASH/NBPF/GOLGA/PRAMEF segmental-duplication families. Long, repetitive and
+# recurrently mis-mapped -- the panel was testing whether mapping error differs
+# by sex.
+#
+# The helper already existed in mohq_common.R; only the oncoplot was calling
+# it. Fixing one caller and not the other is how the same defect ships twice.
+if (isTRUE(args$exclude_flags)) {
+  n_before <- nrow(maf_dt)
+  maf_dt <- drop_flags(maf_dt)
+  if (!nrow(maf_dt))
+    mohq_die("Every variant was removed by the FLAGS filter. Re-run with ",
+             "--exclude_flags false and inspect the MAFs before trusting anything.")
+  mohq_log(sprintf("FLAGS filter removed %s of %s variants (%.1f%%)",
+                   format(n_before - nrow(maf_dt), big.mark = ","),
+                   format(n_before, big.mark = ","),
+                   100 * (n_before - nrow(maf_dt)) / n_before))
+} else {
+  mohq_warn("FLAGS filter is OFF. The selected genes will be dominated by ",
+            "recurrently mis-called artefact genes, and any group difference ",
+            "between them is a difference in mapping error, not in biology.")
+}
 
 if (nzchar(args$genes)) {
   target_genes <- unique(trimws(unlist(strsplit(args$genes, "[,;[:space:]]+"))))
@@ -270,14 +324,52 @@ if (length(usable) > 0) {
 # --------------------------------------------------------------------------- #
 # NB: the object is deliberately NOT called `fga` -- compute_fga() returns a
 # column of that name, and `fga ~ group, data = fga` is needlessly confusing.
-fga_dt <- compute_fga(seg, args$amp, args$del, autosomes_only = TRUE)
+fga_dt <- compute_fga(seg, args$amp, args$del, autosomes_only = TRUE,
+                      min_profiled_mb = args$min_profiled_mb)
 fga_dt <- merge(fga_dt, grp, by = "patient_id")
 fga_dt <- merge(fga_dt, manifest[, .(patient_id, institution)],
                 by = "patient_id", all.x = TRUE)
 
-wt <- tryCatch(wilcox.test(fga ~ factor(group), data = fga_dt), error = function(e) NULL)
+# DROP IMPLAUSIBLE FGA BEFORE TESTING.
+#
+# run_fga_burden.R flags fga >= 0.99 as a copy-number normalisation failure --
+# no tumour has its entire profiled genome altered -- and marks those patients
+# on its plot. This script called the same compute_fga() and then used every
+# row raw, so on MoHQ-HM-19 two samples sitting at exactly 100% went into the
+# boxplot and the Wilcoxon unremarked, in the group with the smaller n.
+#
+# A comparison of genome instability cannot include samples whose instability
+# measurement failed. Excluded here, counted in the subtitle so the exclusion
+# is visible rather than silent.
+fga_dt[, implausible := fga >= 0.99]
+n_bad <- sum(fga_dt$implausible)
+if (n_bad) {
+  mohq_warn(sprintf(paste0(
+    "%d patient(s) have FGA >= 99%%, which is not biologically plausible and ",
+    "indicates a copy-number normalisation failure: %s\n",
+    "  Excluded from the group comparison below."),
+    n_bad, paste(fga_dt$patient_id[fga_dt$implausible], collapse = ", ")))
+  fga_dt <- fga_dt[implausible == FALSE]
+}
+n_thin <- sum(fga_dt$low_coverage)
+if (n_thin)
+  mohq_warn(sprintf("%d patient(s) profiled over < %.0f Mb are retained but marked.",
+                    n_thin, args$min_profiled_mb))
+
+# Re-check group sizes: dropping failed samples can push a group below the
+# threshold that was checked on the full cohort.
+post <- fga_dt[, .N, by = group]
+if (nrow(post) < 2 || any(post$N < args$min_group_n)) {
+  mohq_warn("After excluding implausible FGA, group sizes are ",
+            paste(sprintf("%s=%d", post$group, post$N), collapse = ", "),
+            " -- below --min_group_n. Skipping the instability test.")
+  wt <- NULL
+} else {
+  wt <- tryCatch(wilcox.test(fga ~ factor(group), data = fga_dt), error = function(e) NULL)
+}
 p_txt <- if (!is.null(wt)) sprintf("Wilcoxon (unadjusted) p = %s",
                                    format.pval(wt$p.value, digits = 3)) else ""
+if (n_bad) p_txt <- paste0(p_txt, sprintf("  |  %d sample(s) excluded: FGA >= 99%%", n_bad))
 
 # Institution-adjusted model, reported alongside the unadjusted test rather
 # than instead of it, so the effect of adjustment is visible.

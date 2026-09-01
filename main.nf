@@ -150,6 +150,18 @@ def validateParams() {
 // column (CQ, for instance, has no RNA at all), so downstream joins never drop
 // a cohort silently.
 // --------------------------------------------------------------------------- //
+// A script-level FUNCTION, not a closure defined inside the workflow body.
+//
+// `def has_ens = { row -> ... }` written inside `workflow { }` is compiled as a
+// local closure, and Nextflow then invokes it with the full channel tuple:
+//     Invalid method invocation `call` with arguments:
+//         [MoHQ-MU-16, [collection:MoHQ, ...]] on _closure31 type
+// which reads like a channel-shape error and is really a scoping one.
+// Helpers used inside operator closures belong at script level.
+def hasEnsembleVcf(row) {
+    return row.ensemble_somatic_vcf && row.ensemble_somatic_vcf != 'NA'
+}
+
 def perCohortFiles(ch_rows, ch_keys, String column) {
     def ch_files = ch_rows
         .filter { cid, row -> row[column] && row[column] != 'NA' && row[column].trim() }
@@ -278,14 +290,56 @@ workflow {
     // systematically. Since which patients lost their PCGR VCF is an accident
     // of data management, that difference would masquerade as biology.
     // ---------------------------------------------------------------------- //
+    // regenerate_all_pcgr sends EVERY patient down the regeneration path, so a
+    // cohort ends up with one provenance instead of a mixture. See the note in
+    // nextflow.config: only turn it on after checking that regeneration
+    // reproduces the delivered file for THIS cohort.
+    if (params.regenerate_all_pcgr && !params.run_pcgr_gapfill) {
+        error "regenerate_all_pcgr requires run_pcgr_gapfill true -- otherwise " +
+              "every patient is routed to regeneration and nothing regenerates them."
+    }
+
+    // Under regenerate_all_pcgr a patient is only diverted to regeneration if it
+    // HAS an ensemble VCF to regenerate from. One with a delivered PCGR VCF but
+    // no ensemble VCF keeps its delivered file -- otherwise it would match
+    // neither channel and disappear from the cohort with no message, which is
+    // the exact failure this pipeline exists to prevent.
+
     ch_have_pcgr = ch_ready
-        .filter { cid, row -> row.pcgr_vcf && row.pcgr_vcf != 'NA' }
+        .filter { cid, row -> row.pcgr_vcf && row.pcgr_vcf != 'NA' &&
+                              !(params.regenerate_all_pcgr && hasEnsembleVcf(row)) }
         .map    { cid, row -> tuple(cid, row.patient_id,
                                     file(row.pcgr_vcf, checkIfExists: true)) }
 
+    // Reporting only -- deliberately a SEPARATE branch off ch_ready, placed
+    // after ch_have_pcgr is fully built.
+    //
+    // An earlier version of this block sat between the .filter and the .map
+    // above, which silently orphaned the .map: ch_have_pcgr then emitted
+    // (cohort_id, row) where every consumer expects (cohort_id, patient_id,
+    // file), and the failure surfaced as
+    //     Invalid method invocation `call` with arguments: [MoHQ-MU-16, [...]]
+    // pointing at an unrelated module. Never interrupt an operator chain to
+    // insert a statement.
+    if (params.regenerate_all_pcgr) {
+        ch_ready
+            .filter { cid, row -> row.pcgr_vcf && row.pcgr_vcf != 'NA' && !hasEnsembleVcf(row) }
+            .count()
+            .subscribe { n ->
+                if (n > 0) log.warn """
+                regenerate_all_pcgr is set, but ${n} patient(s) have a delivered
+                PCGR VCF and NO ensemble somatic VCF to rebuild from. They keep
+                their delivered file and are recorded as pcgr_delivered.
+                The cohort therefore still has mixed provenance for those ${n};
+                check mutation_provenance.tsv before treating counts as uniform.
+                """.stripIndent()
+            }
+    }
+
     ch_need_pcgr = ch_ready
-        .filter { cid, row -> (!row.pcgr_vcf || row.pcgr_vcf == 'NA') &&
-                              row.ensemble_somatic_vcf && row.ensemble_somatic_vcf != 'NA' }
+        .filter { cid, row -> (params.regenerate_all_pcgr ||
+                               !row.pcgr_vcf || row.pcgr_vcf == 'NA') &&
+                              hasEnsembleVcf(row) }
         .map    { cid, row ->
             // Reuse an earlier regeneration if one exists.
             def prev = file("${params.regenerated_pcgr_dir}/${cid}/" +
@@ -308,9 +362,22 @@ workflow {
             // variable and belongs in mutation_provenance.tsv.
             def own = (row.pcgr_version && row.pcgr_version != 'unknown'
                        && row.pcgr_version != 'NA') ? row.pcgr_version : null
-            def mod = params.pcgr_module ?: (own ?: params.pcgr_module_fallback)
+
+            // Version substitution for versions that exist but cannot run.
+            // Applied to the patient's OWN version only -- never to a forced
+            // or fallback choice, which are already deliberate.
+            def mapped = null
+            if (own && params.pcgr_module_map) {
+                params.pcgr_module_map.toString().split(',').each { pair ->
+                    def kv = pair.trim().split('=')
+                    if (kv.size() == 2 && kv[0].trim() == own) mapped = kv[1].trim()
+                }
+            }
+
+            def mod = params.pcgr_module ?: (mapped ?: (own ?: params.pcgr_module_fallback))
             def src = params.pcgr_module ? 'forced'
-                    : (own ? 'own_ini' : (params.pcgr_module_fallback ? 'fallback' : 'none'))
+                    : (mapped ? 'mapped'
+                    : (own ? 'own_ini' : (params.pcgr_module_fallback ? 'fallback' : 'none')))
             // dna_tumour_sample travels with the patient: FILTER_ENSEMBLE needs
             // to tell PCGR's depth/VAF tags apart from the normal's, and
             // resolving that from a name is safer than from a column position.
@@ -528,16 +595,19 @@ workflow {
             ch_panel
         )
         ch_figures = ch_figures.mix(ONCOPRINT.out.all_plots)
+                               .mix(ONCOPRINT.out.tables)
     }
 
     if (params.run_cnv_frequency) {
         CNV_FREQUENCY(ch_manifest.join(ch_seg), ch_rlib)
         ch_figures = ch_figures.mix(CNV_FREQUENCY.out.plot)
+                               .mix(CNV_FREQUENCY.out.table)
     }
 
     if (params.run_cnv_burden) {
         CNV_BURDEN(ch_manifest.join(ch_seg), ch_rlib)
         ch_figures = ch_figures.mix(CNV_BURDEN.out.all_plots)
+                               .mix(CNV_BURDEN.out.tables)
     }
 
     if (params.run_pca) {
@@ -554,6 +624,7 @@ workflow {
             ch_rlib
         )
         ch_figures = ch_figures.mix(EXPRESSION_PCA.out.plots)
+                               .mix(EXPRESSION_PCA.out.scores)
     }
 
     if (params.run_comparative) {
@@ -564,6 +635,7 @@ workflow {
             ch_rlib, ch_gtf
         )
         ch_figures = ch_figures.mix(COMPARATIVE.out.plots)
+                               .mix(COMPARATIVE.out.tables)
     }
 
     if (params.run_fusions) {
@@ -573,6 +645,7 @@ workflow {
             ch_rlib
         )
         ch_figures = ch_figures.mix(RECURRENT_FUSIONS.out.plot)
+                               .mix(RECURRENT_FUSIONS.out.table)
     }
 
     if (params.run_gistic) {

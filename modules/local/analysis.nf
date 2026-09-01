@@ -23,7 +23,11 @@ process ONCOPRINT {
     tag   { cohort_id }
     label 'process_high_memory'
 
-    publishDir "${params.outdir}/${cohort_id}/mutations", mode: 'copy'
+    // enabled: !workflow.stubRun -- a -stub-run writes placeholder files;
+    // publishing them overwrites real results. A stub manifest (2 fake
+    // patients) replaced MoHQ-MU-16's real 102-patient manifest this way,
+    // and the preflight then validated the cohort against it.
+    publishDir "${params.outdir}/${cohort_id}/mutations", mode: 'copy', enabled: !workflow.stubRun
 
     input:
     tuple val(cohort_id), path(manifest), path(mafs), path(cna)
@@ -60,6 +64,9 @@ process ONCOPRINT {
         --exclude_flags ${params.exclude_flags} \\
         --extra_flags "${params.extra_flags}" \\
         ${params.gene_panel ? "--gene_panel ${file(params.gene_panel).name}" : ''} \\
+        ${params.gtf ? "--gtf ${params.gtf}" : ''} \\
+        --oncodrive         ${params.run_oncodrive} \\
+        --oncodrive_min_mut ${params.oncodrive_min_mut} \\
         --out_prefix  ${cohort_id}_oncoprint
     """
 
@@ -75,7 +82,11 @@ process CNV_FREQUENCY {
     tag   { cohort_id }
     label 'process_medium'
 
-    publishDir "${params.outdir}/${cohort_id}/cnv", mode: 'copy'
+    // enabled: !workflow.stubRun -- a -stub-run writes placeholder files;
+    // publishing them overwrites real results. A stub manifest (2 fake
+    // patients) replaced MoHQ-MU-16's real 102-patient manifest this way,
+    // and the preflight then validated the cohort against it.
+    publishDir "${params.outdir}/${cohort_id}/cnv", mode: 'copy', enabled: !workflow.stubRun
 
     input:
     tuple val(cohort_id), path(manifest), path(seg)
@@ -111,7 +122,11 @@ process CNV_BURDEN {
     tag   { cohort_id }
     label 'process_low'
 
-    publishDir "${params.outdir}/${cohort_id}/cnv", mode: 'copy'
+    // enabled: !workflow.stubRun -- a -stub-run writes placeholder files;
+    // publishing them overwrites real results. A stub manifest (2 fake
+    // patients) replaced MoHQ-MU-16's real 102-patient manifest this way,
+    // and the preflight then validated the cohort against it.
+    publishDir "${params.outdir}/${cohort_id}/cnv", mode: 'copy', enabled: !workflow.stubRun
 
     input:
     tuple val(cohort_id), path(manifest), path(seg)
@@ -147,7 +162,11 @@ process EXPRESSION_PCA {
     tag   { cohort_id }
     label 'process_high_memory'
 
-    publishDir "${params.outdir}/${cohort_id}/expression", mode: 'copy'
+    // enabled: !workflow.stubRun -- a -stub-run writes placeholder files;
+    // publishing them overwrites real results. A stub manifest (2 fake
+    // patients) replaced MoHQ-MU-16's real 102-patient manifest this way,
+    // and the preflight then validated the cohort against it.
+    publishDir "${params.outdir}/${cohort_id}/expression", mode: 'copy', enabled: !workflow.stubRun
 
     input:
     tuple val(cohort_id), path(manifest), path(expr)
@@ -184,7 +203,11 @@ process COMPARATIVE {
     tag   { cohort_id }
     label 'process_medium'
 
-    publishDir "${params.outdir}/${cohort_id}/comparative", mode: 'copy'
+    // enabled: !workflow.stubRun -- a -stub-run writes placeholder files;
+    // publishing them overwrites real results. A stub manifest (2 fake
+    // patients) replaced MoHQ-MU-16's real 102-patient manifest this way,
+    // and the preflight then validated the cohort against it.
+    publishDir "${params.outdir}/${cohort_id}/comparative", mode: 'copy', enabled: !workflow.stubRun
 
     input:
     tuple val(cohort_id), path(manifest), path(mafs), path(seg)
@@ -213,6 +236,8 @@ process COMPARATIVE {
         --amp          ${params.amp_threshold} \\
         --del          ${params.del_threshold} \\
         --min_group_n  ${params.comparative_min_group_n} ${sexchr} \\
+        --exclude_flags ${params.exclude_flags} \\
+        --min_profiled_mb ${params.min_profiled_mb} \\
         --out_prefix   ${cohort_id}_comparative
     """
 
@@ -227,7 +252,11 @@ process RECURRENT_FUSIONS {
     tag   { cohort_id }
     label 'process_low'
 
-    publishDir "${params.outdir}/${cohort_id}/fusions", mode: 'copy'
+    // enabled: !workflow.stubRun -- a -stub-run writes placeholder files;
+    // publishing them overwrites real results. A stub manifest (2 fake
+    // patients) replaced MoHQ-MU-16's real 102-patient manifest this way,
+    // and the preflight then validated the cohort against it.
+    publishDir "${params.outdir}/${cohort_id}/fusions", mode: 'copy', enabled: !workflow.stubRun
 
     input:
     tuple val(cohort_id), path(manifest), path(annofuse), path(linx)
@@ -261,7 +290,11 @@ process GISTIC {
     tag   { cohort_id }
     label 'process_high_memory'
 
-    publishDir "${params.outdir}/${cohort_id}/gistic", mode: 'copy'
+    // enabled: !workflow.stubRun -- a -stub-run writes placeholder files;
+    // publishing them overwrites real results. A stub manifest (2 fake
+    // patients) replaced MoHQ-MU-16's real 102-patient manifest this way,
+    // and the preflight then validated the cohort against it.
+    publishDir "${params.outdir}/${cohort_id}/gistic", mode: 'copy', enabled: !workflow.stubRun
 
     input:
     tuple val(cohort_id), path(seg), path(markers)
@@ -324,7 +357,11 @@ process COHORT_REPORT {
     tag   { cohort_id }
     label 'process_low'
 
-    publishDir "${params.outdir}/${cohort_id}/report", mode: 'copy'
+    // enabled: !workflow.stubRun -- a -stub-run writes placeholder files;
+    // publishing them overwrites real results. A stub manifest (2 fake
+    // patients) replaced MoHQ-MU-16's real 102-patient manifest this way,
+    // and the preflight then validated the cohort against it.
+    publishDir "${params.outdir}/${cohort_id}/report", mode: 'copy', enabled: !workflow.stubRun
 
     input:
     tuple val(cohort_id), path(manifest), path(completeness), path(figures, stageAs: 'figures/*')
@@ -349,12 +386,39 @@ process COHORT_REPORT {
     //
     // Only parameters that change a NUMBER are recorded. Paths and toggles are
     // noise in a results document.
+    // RECORD THE TOGGLES, NOT ONLY THE THRESHOLDS.
+    //
+    // This list was numeric settings only, so every run_* switch resolved to
+    // its default in the report. Two consequences, both silent:
+    //
+    //   1. absent() decides between "you turned this off" and "this failed"
+    //      by reading its toggle. With the toggle unrecorded it always chose
+    //      the alarming wording, for all seven panels.
+    //   2. The eligibility table counts gap-filled patients as having a PCGR
+    //      VCF only when run_pcgr_gapfill is true. Unrecorded, it read false,
+    //      so MoHQ-HM-19 reported 20 eligible for mutations after a gap-fill
+    //      run that produced 44 MAFs.
+    //
+    // params[k] already includes command-line overrides, so `--run_pcgr_gapfill
+    // true` is captured once the key is listed here.
     def reported = ['genome_build','callable_mb','amp_threshold','del_threshold',
                     'cnv_bin_size','include_sex_chr','min_seg_markers',
                     'min_profiled_mb','oncoplot_top_genes','exclude_flags',
                     'extra_flags','pca_norm_method','pca_top_var_genes',
                     'pca_colour_by','min_fusion_recurrence','inhibit_vep',
-                    'vep_cache_version','min_annotated_genes','max_unknown_frac']
+                    'vep_cache_version','min_annotated_genes','max_unknown_frac',
+                    // toggles read by absent() and by the eligibility table
+                    'run_pcgr_gapfill','run_oncoprint','run_cnv_frequency',
+                    'run_cnv_burden','run_pca','run_fusions','run_comparative',
+                    'run_completeness_plot','run_gistic','run_collection',
+                    'comparative_group_col','comparative_min_group_n',
+                    'comparative_n_genes','pcgr_module_fallback','extra_metadata',
+                    // Which genes a figure was built on, and how they were ranked.
+                    // Without these the report cannot say whether an oncoplot was
+                    // restricted to a panel or ranked over everything -- the first
+                    // question anyone asks of a filtered gene list.
+                    'gene_panel','gtf','run_oncodrive','oncodrive_min_mut',
+                    'completeness_drop_never_present']
     def rows = reported.collect { k ->
         "${k}\t${params.containsKey(k) && params[k] != null ? params[k] : 'unset'}"
     }.join('\n')

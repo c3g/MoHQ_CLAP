@@ -103,3 +103,10 @@ __pycache__/
 # assets/*.tsv, *.csv      -- example samplesheet and cohort map. Synthetic.
 # params/*.yaml            -- run configuration. Contains cluster paths but no
 #                             patient data.
+
+# Harvest bookkeeping: rclone listings and receipts, one line per
+# patient file. Regenerable, and not for publishing.
+.harvest_cache/
+
+# Directory snapshots
+tree*.txt

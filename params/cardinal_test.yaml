@@ -118,7 +118,11 @@ run_report:            true
 #
 run_collection:        false
 # cohort_map:          "assets/cohort_map.tsv"
-run_comparative:       false   # needs a GTF + clinical metadata
+extra_metadata:        "/home/mslavova/MoHQ/metadata/mohq_sex.tsv"
+run_comparative:       true   # needs a GTF + clinical metadata
+comparative_group_col:   "Sex"
+comparative_min_group_n: 5
+gtf: "/cvmfs/soft.mugqic/CentOS6/genomes/species/Homo_sapiens.GRCh38/annotations/Homo_sapiens.GRCh38.Ensembl104.gtf"
 run_gistic:            false   # needs the GISTIC refgene .mat
 
 # --- analysis settings ------------------------------------------------------
@@ -140,7 +144,7 @@ del_threshold: -0.58
 callable_mb: 30
 
 pca_norm_method: "log2"
-pca_colour_by: "institution"
+pca_colour_by: "pcgr_version"
 
 # --- cluster ----------------------------------------------------------------
 # Account and partitions are set in the `cardinal` profile in nextflow.config

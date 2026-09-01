@@ -14,6 +14,11 @@ which source and which tool versions were used.
 
 ## Contents
 
+**New here?** Read [`docs/TUTORIAL.md`](docs/TUTORIAL.md) instead. It walks one
+real cohort from harvest to report — every command, every number, and what to
+check before moving to the next step. This README is the reference you come back
+to once you know the shape of a run.
+
 - [Quick start](#quick-start)
 - [How the pipeline works](#how-the-pipeline-works)
 - [What each file does](#what-each-file-does)
@@ -250,11 +255,8 @@ position, which is what the frequency plot draws.
 and most cohort CNV figures use, and it was chosen on that basis. The trade-off:
 smaller bins show finer detail but produce noisier plots and more rows (the
 binning step refuses to run past 50 M rows); larger bins smooth real focal
-events away. 1 Mb is a reasonable default because most arm-level and
-chromosome-level events — the ones a cohort plot is meant to reveal — are tens
-of Mb wide, while focal amplifications of a single gene are usually below the
-resolution of any cohort-level figure anyway.
-
+events away. 
+    
 If the cohort's biology is focal (e.g. *ERBB2* amplification in breast), 1 Mb may
 be too coarse; drop to 100 kb and compare. That is a judgement call for the
 analysis, not a fixed property of the pipeline, which is why it is a parameter.
@@ -387,8 +389,7 @@ as a covariate.
 here is non-synonymous (coding) variants, so the denominator is the coding
 footprint (~30–40 Mb) even for whole-genome data. The first real run used 2800
 and produced 0.01–0.05 mut/Mb — about 90× too low; the same variants over 30 Mb
-give 0.9–4.7, which is a believable range. An earlier version of this README
-advised the opposite, which was wrong.
+give 0.9–4.7, which is a believable range.
 
 **The top genes are filtered.** `exclude_flags` removes FLAGS genes (mucins,
 WASH/NBPF/GOLGA families, FLG, HRNR, AHNAK2 and similar) before ranking. Without

@@ -10,7 +10,11 @@ process COLLECTION_ROLLUP {
     tag   'collection'
     label 'process_medium'
 
-    publishDir "${params.outdir}/_collection", mode: 'copy'
+    // enabled: !workflow.stubRun -- a -stub-run writes placeholder files;
+    // publishing them overwrites real results. A stub manifest (2 fake
+    // patients) replaced MoHQ-MU-16's real 102-patient manifest this way,
+    // and the preflight then validated the cohort against it.
+    publishDir "${params.outdir}/_collection", mode: 'copy', enabled: !workflow.stubRun
 
     input:
     path manifests,    stageAs: 'manifests/*'
@@ -46,7 +50,11 @@ process BATCH_EFFECT_ANALYSIS {
     tag   'collection'
     label 'process_medium'
 
-    publishDir "${params.outdir}/_collection/batch_effects", mode: 'copy'
+    // enabled: !workflow.stubRun -- a -stub-run writes placeholder files;
+    // publishing them overwrites real results. A stub manifest (2 fake
+    // patients) replaced MoHQ-MU-16's real 102-patient manifest this way,
+    // and the preflight then validated the cohort against it.
+    publishDir "${params.outdir}/_collection/batch_effects", mode: 'copy', enabled: !workflow.stubRun
 
     input:
     path manifests, stageAs: 'manifests/*'
@@ -78,5 +86,3 @@ process BATCH_EFFECT_ANALYSIS {
     touch batch_effect_analysis.versions.txt
     """
 }
-
-

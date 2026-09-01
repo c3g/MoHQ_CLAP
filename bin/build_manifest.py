@@ -536,9 +536,48 @@ def read_build_table(path: Path) -> dict[str, str]:
     return out
 
 
+def scan_external_pcgr(dirs: Iterable[Path]) -> dict[str, Path]:
+    """patient_id -> PCGR VCF, for VCFs delivered outside patient directories.
+
+    Keyed on the patient ID parsed from the filename, so it tolerates the
+    naming differences between batches (`MoHQ-MU-16-11.pcgr_acmg.grch38.vcf.gz`
+    has no `_D`, unlike the in-patient convention).
+
+    A patient appearing twice within the SAME batch directory is reported
+    rather than silently resolved -- two candidate mutation files for one
+    patient is a question, not a preference.
+    """
+    found: dict[str, Path] = {}
+    dupes: dict[str, list[Path]] = {}
+    for d in dirs:
+        d = d.resolve()
+        if not d.is_dir():
+            print(f"[manifest] WARNING: --external-pcgr-dir not found: {d}",
+                  file=sys.stderr)
+            continue
+        for f in sorted(d.glob("*.vcf.gz")):
+            pid = patient_id_of(f.name)
+            if not pid:
+                continue
+            if pid in found and found[pid] != f:
+                dupes.setdefault(pid, [found[pid]]).append(f)
+                continue
+            found[pid] = f
+    if dupes:
+        print(f"[manifest] WARNING: {len(dupes)} patient(s) have MORE THAN ONE "
+              f"external PCGR VCF; keeping the first and ignoring the rest:",
+              file=sys.stderr)
+        for pid, paths in list(dupes.items())[:5]:
+            print(f"    {pid}: {', '.join(p.name for p in paths)}", file=sys.stderr)
+    if found:
+        print(f"[manifest] external PCGR VCFs: {len(found)} patient(s)")
+    return found
+
+
 def build_rows(patient_dirs: Iterable[Path],
                cache: dict | None = None,
-               build_table: dict[str, str] | None = None
+               build_table: dict[str, str] | None = None,
+               external_pcgr: dict[str, Path] | None = None
                ) -> tuple[list[dict], list[dict], list[Ambiguity], dict]:
     manifest_rows: list[dict] = []
     sample_rows: list[dict] = []
@@ -640,10 +679,34 @@ def build_rows(patient_dirs: Iterable[Path],
         #   regenerable -- no PCGR VCF, but an ensemble VCF exists, so RUN_PCGR
         #                  can rebuild one. NOT a reason to exclude the patient.
         #   unavailable -- neither; nothing can be done
+        # A PCGR VCF delivered OUTSIDE the patient directory.
+        #
+        # Not every cohort files its PCGR VCFs under <patient>/reports/pcgr/.
+        # MoHQ-MU-16 also carries a dated batch directory
+        # (20231122_vepvcfs/) holding <patient_id>.pcgr_acmg.grch38.vcf.gz --
+        # note: no _D suffix, so none of the in-patient patterns match it.
+        #
+        # For 35 of 102 patients that batch is the ONLY delivered PCGR VCF.
+        # Without this, those patients look regenerable and PCGR is re-run to
+        # produce a file the project already shipped.
+        #
+        # The in-patient copy WINS when both exist. Checked on MoHQ-MU-16-11,
+        # which has both: identical VEP run timestamp and identical variant
+        # count, i.e. the same PCGR execution filed twice. Preferring the
+        # in-patient path keeps the common case conventional; the source is
+        # recorded either way so the choice is never invisible.
+        if row["pcgr_vcf"] == "NA" and external_pcgr:
+            ext = external_pcgr.get(patient_id)
+            if ext:
+                row["pcgr_vcf"] = str(ext)
+                row["pcgr_vcf_external"] = "yes"
+
         if row["pcgr_vcf"] != "NA":
             row["pcgr_vcf_status"] = "delivered"
             row["mutation_vcf"] = row["pcgr_vcf"]
-            row["mutation_vcf_source"] = "pcgr_delivered"
+            row["mutation_vcf_source"] = (
+                "pcgr_delivered_external" if row.get("pcgr_vcf_external") == "yes"
+                else "pcgr_delivered")
         elif row["ensemble_somatic_vcf"] != "NA":
             row["pcgr_vcf_status"] = "regenerable"
             row["mutation_vcf"] = row["ensemble_somatic_vcf"]
@@ -751,6 +814,15 @@ def main(argv: list[str] | None = None) -> int:
                     help="TSV from bin/check_genome_build.sh. Genome build read from "
                          "BAM/VCF headers OVERRIDES the filename claim, which the MoHQ "
                          "collection is known to get wrong.")
+    ap.add_argument("--external-pcgr-dir", type=Path, action="append", default=None,
+                    metavar="DIR",
+                    help="Directory of PCGR VCFs delivered OUTSIDE the patient "
+                         "folders, named <patient_id>*.vcf.gz. Repeatable. Used "
+                         "only for patients with no in-patient PCGR VCF; the "
+                         "in-patient copy always wins. Recorded as "
+                         "mutation_vcf_source=pcgr_delivered_external. "
+                         "Example: MoHQ-MU-16/20231122_vepvcfs, which is the "
+                         "only delivered PCGR VCF for 35 of its 102 patients.")
     ap.add_argument("--path-root", type=Path, default=None,
                     help="Prefix to record in the manifest instead of the resolved "
                          "--root. Only needed if --root is a COPY of the collection "
@@ -815,8 +887,10 @@ def main(argv: list[str] | None = None) -> int:
         build_table = read_build_table(args.build_table)
         print(f"[manifest] loaded verified genome build for {len(build_table)} patient(s)")
 
+    external_pcgr = scan_external_pcgr(args.external_pcgr_dir or [])
+
     manifest_rows, sample_rows, ambiguities, new_cache = build_rows(
-        pdirs, cache, build_table)
+        pdirs, cache, build_table, external_pcgr)
 
     if emit_root != scan_root:
         path_cols = ["patient_dir", "mutation_vcf"] + [a.name for a in ASSETS]

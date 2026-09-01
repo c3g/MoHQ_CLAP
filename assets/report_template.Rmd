@@ -48,6 +48,34 @@ show_fig <- function(pattern, alt = "figure") {
 }
 
 # ---------------------------------------------------------------------------
+# Per-figure explanation.
+#
+# A figure with no caption is read by whoever opens the report months later,
+# out of context, usually without the person who made it. `reads` says how to
+# interpret the axes; `caveat` says what would make it misleading.
+#
+# Keep caveats about the METHOD and about how to read the figure -- denominators,
+# gene selection, power, what a metric can and cannot show. They are guidance
+# for the reader. Do not write pipeline history into them: a delivered report is
+# not the place to narrate what was fixed along the way, and a reader who was
+# not there reads it as a warning about the current output.
+#
+# Printed BEFORE the figure, not after: a reader who scrolls past a plot they
+# have already misread does not come back for the caption.
+# ---------------------------------------------------------------------------
+fig_note <- function(title, reads, caveat = NULL) {
+  cat(sprintf(
+    paste0("\n<div style='margin:14px 0 6px 0;padding:10px 12px;",
+           "border-left:4px solid #1C7293;background:#F4F7F9;font-size:0.94em;'>",
+           "<strong>%s</strong><br>%s%s</div>\n\n"),
+    title, reads,
+    if (is.null(caveat)) ""
+    else sprintf("<br><span style='color:#8A5A2B;'><strong>Careful:</strong> %s</span>",
+                 caveat)))
+  invisible(TRUE)
+}
+
+# ---------------------------------------------------------------------------
 # Missing-panel reporting.
 #
 # The previous fallbacks said things like "bypassed via user toggles" and
@@ -74,7 +102,13 @@ param_val <- function(k, default = NA) {
 }
 
 absent <- function(pattern, toggle = NULL, data_reason = NULL) {
-  if (length(grep(pattern, figs))) return(invisible(NULL))
+  # MATCH IMAGES ONLY, like show_fig does.
+  #
+  # `figs` now carries the analyses' .tsv tables as well as their .png plots,
+  # so a bare grep would treat "the table exists" as "the figure exists" and
+  # silently suppress the missing-panel notice for a step that produced its
+  # numbers and failed to draw them -- the one case this function is for.
+  if (length(grep(pattern, figs[grepl("\\.png$", figs)]))) return(invisible(NULL))
   enabled <- if (!is.null(toggle)) param_val(toggle) else NA
   msg <- if (!is.na(enabled) && tolower(as.character(enabled)) %in% c("false", "0", "no")) {
     sprintf("**Not run.** `%s` was set to `false` for this run.", toggle)
@@ -131,12 +165,42 @@ if (!is.null(man)) {
   # Every figure below states its own n in its title. This block reports the
   # eligible population per analysis so the differences are visible up front
   # rather than discovered by comparing figure titles.
-  has <- function(...) {
+  # EVERY analysis sits behind the analysis_ready gate.
+  #
+  # main.nf builds ch_ready = rows where analysis_ready == 'yes', and every
+  # downstream channel -- ch_cna, ch_cnvkit, the mutation channels, expression,
+  # fusions -- branches off it. So holding the input file is necessary but not
+  # sufficient: a patient missing ANY required asset never reaches ANY figure.
+  #
+  # Counting the input column alone overstates all four rows. On MoHQ-MU-16 it
+  # printed 86 eligible for mutations while the oncoplot contained 73, because
+  # 29 patients lack cna_segments and are gated out of everything, mutations
+  # included. Same class of error as the 49-vs-20 one this block already
+  # documents -- there the wrong COLUMN, here the missing GATE.
+  has <- function(..., ready_only = TRUE) {
     cols <- c(...)
     cols <- cols[cols %in% names(man)]
     if (!length(cols)) return(NA_integer_)
     # A patient counts if ANY of the listed columns is populated.
     ok <- Reduce(`|`, lapply(cols, function(cc) !is.na(man[[cc]]) & man[[cc]] != "NA"))
+    if (ready_only && "analysis_ready" %in% names(man))
+      ok <- ok & (man$analysis_ready == "yes")
+    sum(ok)
+  }
+
+  # Gap-fill changes who has a PCGR VCF, and the manifest cannot know it.
+  #
+  # pcgr_vcf is written before the run. With --run_pcgr_gapfill true, RUN_PCGR
+  # creates a PCGR VCF for every `regenerable` patient, so they DO reach the
+  # mutation figures -- 16 of them here. Counting only pcgr_vcf therefore
+  # understates the mutation row in exactly the situation where the pipeline
+  # did the most work.
+  gapfill_on <- isTRUE(as.logical(param_val("run_pcgr_gapfill", FALSE)))
+  n_mut <- function(col) {
+    if (!identical(col, "pcgr_vcf") || !gapfill_on) return(has(col))
+    ok <- ((!is.na(man[[col]]) & man[[col]] != "NA") |
+           (man$pcgr_vcf_status %in% "regenerable"))
+    if ("analysis_ready" %in% names(man)) ok <- ok & (man$analysis_ready == "yes")
     sum(ok)
   }
 
@@ -151,7 +215,9 @@ if (!is.null(man)) {
   # looks authoritative and is wrong.
   mut_col <- if (isTRUE(as.logical(param_val("inhibit_vep", TRUE)))) "pcgr_vcf" else "mutation_vcf"
   mut_req <- if (identical(mut_col, "pcgr_vcf"))
-    "delivered PCGR VCF (inhibit_vep is on, so ensemble-only patients are excluded)"
+    paste0("PCGR VCF",
+           if (gapfill_on) " (delivered, or regenerated by this run)"
+           else " (inhibit_vep is on, so ensemble-only patients are excluded)")
   else "any somatic VCF"
 
   cat(sprintf("**%d patients** in this cohort, **%d analysis-ready**.\n\n", n, ready))
@@ -161,11 +227,13 @@ if (!is.null(man)) {
                  "Expression (PCA)", "Fusions"),
     Requires = c(mut_req, "CNVkit VCF (the cohort .seg is built from these)",
                  "expression file", "Anno-FUSE or LINX calls"),
-    `Eligible patients` = c(has(mut_col), has("cnvkit_vcf"),
+    `Eligible patients` = c(n_mut(mut_col), has("cnvkit_vcf"),
                             has("expression_genes"), has("anno_fuse", "linx_fusion")),
     check.names = FALSE)
   print(kable(elig))
   cat("\n")
+  cat(sprintf("_Counts are patients that hold the input **and** pass the analysis-ready gate (%d of %d), since every analysis reads from that set._\n\n",
+              ready, n))
   cat("_If a figure's n differs from the number here, the analysis dropped patients for a further reason -- check its log._\n\n")
   cat(sprintf("- Institution(s): %s\n", insts))
   cat(sprintf("- With RNA: %d/%d\n", rna, n))
@@ -204,6 +272,17 @@ if (!is.null(runp)) {
 ## Data completeness
 
 ```{r completeness, results='asis'}
+fig_note(
+  "Completeness — which patients hold which files",
+  paste("One row per patient, one column per expected asset, coloured by",
+        "present or absent. Reading down a column shows an asset missing across",
+        "many patients, which usually points at a processing round rather than",
+        "at individual patients; reading across a row shows a patient missing",
+        "several things at once."),
+  paste("this reflects what was HARVESTED, not necessarily what exists on the",
+        "object store. A file set excluded at harvest time appears here as",
+        "uniformly absent — check the harvest sets before reporting a gap",
+        "upstream."))
 show_fig("completeness_heatmap", "Completeness")
 absent("completeness", data_reason = "No completeness matrix was produced.")
 ```
@@ -215,13 +294,54 @@ if (!is.null(comp)) {
                   present = vapply(ac, function(a) sum(comp[[a]] == "yes"), numeric(1)),
                   total = nrow(comp))
   s[, pct := round(100 * present / total, 1)]
-  dt_show(s[order(pct)], "Completeness by asset (sortable, exportable)", digits = 1)
+
+  # Split the two questions the one table was answering at once. Assets present
+  # for NO patient are a harvest-scope choice far more often than a delivery
+  # gap, and mixing them into the same list makes the cohort look far emptier
+  # than it is. They are also excluded from the heatmap above for the same
+  # reason, so the table has to say where they went.
+  never <- s[present == 0]
+  s     <- s[present > 0]
+
+  # Narrative FIRST, table LAST. Only the last expression in a chunk is
+  # auto-printed, so a dt_show() followed by anything else is built and then
+  # discarded -- the table vanishes silently.
+  if (nrow(never)) {
+    cat(sprintf(paste0("\n### Assets absent for every patient (%d)\n\n",
+                       "These are **not** in the heatmap above. An asset missing for ",
+                       "all %d patients is usually a harvest scope choice rather than ",
+                       "a delivery gap — `harvest_juno.py` transfers a chosen `--sets` ",
+                       "and everything else is absent locally by design. Confirm ",
+                       "against the object store before reporting any of these ",
+                       "upstream.\n\n"),
+                nrow(never), nrow(comp)))
+    print(kable(never[order(asset), .(asset)]))
+    cat("\n\n")
+  }
+
+  dt_show(s[order(pct)], "Completeness by asset, for assets present in at least one patient",
+          digits = 1)
 }
 ```
 
 ## Somatic mutations
 
 ```{r onco, results='asis'}
+fig_note(
+  "Oncoplot — the cohort's mutation landscape",
+  paste("One row per gene, one column per patient, ordered by how many patients",
+        "carry a mutation. Colour is the variant class (missense, nonsense,",
+        "frameshift, splice site); black means more than one mutation in that",
+        "gene for that patient. The bar above each column is that patient's",
+        "mutation burden; the percentage on the right is the fraction of the",
+        "cohort altered in that gene. Copy-number gains and losses are overlaid",
+        "from PCGR's <code>cna_segments</code>, joined on gene symbol."),
+  paste("genes are selected by mutation FREQUENCY, and in whole-genome data that",
+        "ranking returns long, repetitive and segmentally duplicated genes",
+        "before it returns drivers. An artefact filter is applied (see the",
+        "unfiltered ranking table below), but it is a blocklist and blocklists",
+        "do not converge — check that the top genes are plausible for this",
+        "tumour type before drawing any conclusion."))
 show_fig("_oncoprint\\.png", "Oncoplot")
 absent("_oncoprint\\.png", toggle = "run_oncoprint")
 ```
@@ -230,7 +350,82 @@ absent("_oncoprint\\.png", toggle = "run_oncoprint")
 dt_show(read_tbl("_gene_summary\\.tsv$"), "Per-gene mutation summary")
 ```
 
+```{r gene_rank_note, results='asis'}
+# TEXT chunk. Markdown from cat() needs results='asis'; the WIDGET below must
+# NOT be in an asis chunk, because a DT table needs the normal knit_print path
+# and renders as nothing under 'asis'. Hence two chunks rather than one.
+#
+# The ranking BEFORE the artefact filter, alongside the one after it. Showing
+# both lets a reader judge the filter rather than trust it: `is_flags` marks
+# every gene removed, so the two lists together say more than either alone.
+rk <- read_tbl("_gene_rank_unfiltered\\.tsv$")
+if (!is.null(rk) && "is_flags" %in% names(rk)) {
+  n_flag <- sum(as.logical(rk$is_flags), na.rm = TRUE)
+  if (n_flag > 0) {
+    cat(sprintf(paste0("\n**%d of the %d ranked genes** are on the artefact list and ",
+                       "do not appear in the oncoplot above. These are long, repetitive ",
+                       "or segmentally duplicated genes that accumulate mapping errors ",
+                       "and rank high on frequency without being drivers. The `is_flags` ",
+                       "column marks them.\n\n"),
+                n_flag, nrow(rk)))
+  }
+}
+```
+
+```{r gene_rank_tbl}
+dt_show(rk, "Gene ranking before the artefact filter (is_flags = excluded)")
+```
+
+```{r oncodrive_note, results='asis'}
+od <- read_tbl("_oncodrive\\.tsv$")
+if (!is.null(od)) {
+  fig_note(
+    "Genes ranked by clustering, not by count",
+    paste("Frequency ranking favours long genes: a bigger coding sequence is a",
+          "bigger target for passenger mutations. This asks a different",
+          "question — are a gene's mutations <em>concentrated</em> at",
+          "particular residues, more than chance would give? Positive",
+          "selection piles mutations on the same few positions; a passenger",
+          "process scatters them. Gene length cancels out."),
+    paste("this finds hotspot oncogenes (BRAF V600, NRAS Q61, KRAS G12) and",
+          "systematically MISSES tumour suppressors — CDKN2A, NF1 and TP53 are",
+          "inactivated by truncating mutations spread along the gene, which is",
+          "exactly the pattern this test scores as 'not clustered'. Read it",
+          "beside the frequency ranking, not instead of it."))
+}
+```
+
+```{r oncodrive_fig, results='asis'}
+show_fig("_oncodrive\\.png", "Genes with clustered mutations")
+```
+
+```{r oncodrive_tbl}
+dt_show(od, "Positional clustering per gene (oncodrive; low FDR = clustered)")
+```
+
+```{r rank_cmp_tbl}
+# The two rankings side by side. High on frequency and absent from clustering
+# is the length-bias case; high on clustering and modest on frequency is what
+# the frequency ranking was hiding.
+dt_show(read_tbl("_rank_comparison\\.tsv$"),
+        "Frequency rank vs clustering rank, per gene")
+```
+
+
+
 ```{r tmb, results='asis'}
+fig_note(
+  "Tumour mutational burden — mutations per megabase, per patient",
+  paste("Non-synonymous coding variants divided by the callable territory.",
+        "Patients are ordered by burden, so hypermutators sit at one end.",
+        "TMB is used clinically as an immunotherapy-response marker, which is",
+        "why the absolute value matters and not just the ranking."),
+  paste("the denominator must match what the numerator counts. This pipeline",
+        "counts CODING variants, so the denominator is the coding footprint",
+        "(~30 Mb) even though this is whole-genome sequencing. A whole-genome",
+        "denominator of 2,800 Mb would scale every value down by roughly 90x,",
+        "and the result would still fall in a readable range — so check the",
+        "value stated above against the assay rather than the plot."))
 show_fig("_tmb\\.png", "Tumour mutational burden")
 ```
 
@@ -245,31 +440,97 @@ if (!is.null(tmb)) {
 ```
 
 ```{r pathways, results='asis'}
+fig_note(
+  "Oncogenic pathways — mutations grouped by the pathway they act in",
+  paste("Genes are collapsed into curated signalling pathways (RTK-RAS, TP53,",
+        "cell cycle, and so on) and the fraction of the cohort affected in each",
+        "is shown. Useful because two patients can have different genes",
+        "mutated and the same pathway disrupted, which a gene-level view hides."),
+  paste("pathway membership comes from a fixed curated list, so a gene absent",
+        "from that list contributes to nothing — a pathway reading 0% may mean",
+        "'not mutated' or 'not annotated'."))
 show_fig("_pathways\\.png", "Oncogenic pathways")
+# Every other panel has this guard; pathways did not, so a missing figure left
+# an explanatory note hanging above nothing.
+absent("_pathways\\.png", toggle = "run_oncoprint",
+       data_reason = paste("The pathway table below was produced but the plot was not.",
+                           "maftools draws it as a side effect, so this usually means",
+                           "no gene in the cohort mapped to a curated pathway."))
+```
+
+```{r pathway_tbl}
+dt_show(read_tbl("_pathways\\.tsv$"), "Oncogenic pathways: fraction of the cohort affected")
+```
+
+```{r interactions, results='asis'}
+fig_note(
+  "Mutual exclusivity and co-occurrence",
+  paste("Every pair of frequently mutated genes tested for whether they occur",
+        "together more or less often than chance. Mutual exclusivity can point",
+        "to two routes to the same phenotype (only one is needed);",
+        "co-occurrence can point to cooperation, or to a shared cause such as",
+        "a hypermutator phenotype."),
+  paste("this tests many gene pairs at once on a small cohort, so with n in the",
+        "tens most cells hold single-digit counts. Treat significance here as a",
+        "hypothesis, not a result."))
 show_fig("_somatic_interactions", "Mutual exclusivity / co-occurrence")
+```
+
+
+```{r interactions_tbl}
+dt_show(read_tbl("_somatic_interactions\\.tsv$"),
+        "Gene-pair mutual exclusivity / co-occurrence tests")
 ```
 
 ## Copy number
 
 ```{r cnvfreq, results='asis'}
+fig_note(
+  "Genome-wide copy-number frequency",
+  paste("The genome is divided into 1 Mb bins and, for each bin, the percentage",
+        "of patients with a gain is drawn above the axis and the percentage",
+        "with a loss below it, left to right across the chromosomes. Peaks are",
+        "regions recurrently altered across the cohort — the starting point for",
+        "asking which gene in that region is being selected for."),
+  paste("this shows WHERE alterations recur, not whether they matter. Broad arm",
+        "and chromosome-level events dominate the picture, and identifying a",
+        "driver within a peak needs a focal-peak method such as GISTIC, which",
+        "is a separate step."))
 show_fig("_cnv_frequency", "Genome-wide CNV frequency")
 absent("_cnv_frequency", toggle = "run_cnv_frequency")
 ```
 
 ```{r burden, results='asis'}
+fig_note(
+  "Copy-number burden — Fraction of Genome Altered",
+  paste("Per patient, the proportion of the profiled genome that is gained or",
+        "lost. A single-number summary of genome instability: near zero means a",
+        "quiet genome, high values mean widespread rearrangement. Patients",
+        "profiled over too little of the genome are marked, and values at or",
+        "above 99% are marked separately."),
+  paste("the denominator is the length actually profiled FOR THAT PATIENT, not",
+        "a fixed genome size, so values stay comparable between samples with",
+        "different callable footprints. Check <code>profiled_mb</code> in the",
+        "table below alongside any value you rely on. An FGA at or above 99%",
+        "indicates a copy-number normalisation problem for that sample rather",
+        "than an exceptionally unstable tumour."))
 show_fig("_cnv_burden\\.png", "Copy-number burden")
 absent("_cnv_burden\\.png", toggle = "run_cnv_burden")
 show_fig("_by_institution", "FGA by institution")
 ```
 
 ```{r fga_tbl}
+# ORDER MATTERS: only the LAST expression in a chunk is auto-printed, and a DT
+# widget is an object like any other. A dt_show() followed by a cat() creates
+# the widget and then throws it away -- the table simply does not appear, with
+# no error. So any narrative text goes FIRST and dt_show() goes LAST.
 fga <- read_tbl("_cnv_burden\\.tsv$")
 if (!is.null(fga)) {
-  dt_show(fga, "Fraction of Genome Altered per patient")
   if ("low_coverage" %in% names(fga) && any(fga$low_coverage)) {
-    cat(sprintf("\n**%d patient(s) flagged low-coverage** (profiled over less than %s Mb of autosome). Their FGA is not comparable to the rest of the cohort.\n",
+    cat(sprintf("\n**%d patient(s) flagged low-coverage** (profiled over less than %s Mb of autosome). Their FGA is not comparable to the rest of the cohort.\n\n",
                 sum(fga$low_coverage), param_val("min_profiled_mb", "?")))
   }
+  dt_show(fga, "Fraction of Genome Altered per patient")
 }
 ```
 
@@ -280,6 +541,19 @@ if (!is.null(fga)) {
 ## Expression
 
 ```{r pca, results='asis'}
+fig_note(
+  "Expression PCA — do samples separate, and by what?",
+  paste("Each point is a patient, positioned by the two directions of largest",
+        "variation across the most variable genes. Points close together have",
+        "similar expression profiles. The scree plot beneath shows how much",
+        "variance each component captures — if PC1 holds most of it, one",
+        "dominant factor is driving the data."),
+  paste("this figure is diagnostic before it is biological. The question to ask",
+        "first is whether separation tracks a TECHNICAL variable — processing",
+        "round, institution, PCGR version — because if it does, downstream",
+        "comparisons are measuring the pipeline. Colouring by a constant (such",
+        "as institution within a single-institution cohort) gives one colour",
+        "and answers nothing."))
 show_fig("_expression_pca\\.png", "Expression PCA")
 absent("_expression_pca\\.png", toggle = "run_pca",
        data_reason = "This cohort has fewer than three RNA samples, so a PCA cannot be computed.")
@@ -312,6 +586,19 @@ if (!is.null(sc) && "is_outlier" %in% names(sc)) {
 ## Fusions
 
 ```{r fusions, results='asis'}
+fig_note(
+  "Recurrent fusions — gene pairs seen in more than one patient",
+  paste("Fusion calls aggregated across the cohort and ranked by how many",
+        "patients carry each gene pair. Two independent sources are used:",
+        "Anno-FUSE from the RNA, and LINX from the whole-genome structural",
+        "variants. A pair supported by BOTH has RNA evidence of a transcript",
+        "and DNA evidence of the rearrangement that would produce it, which is",
+        "much stronger than either alone."),
+  paste("recurrence is the signal, and a fusion in a single patient is a",
+        "curiosity rather than a finding. Read-through transcripts between",
+        "neighbouring genes are a common false positive in RNA-only calls —",
+        "if a pair has no DNA support, check whether the two genes are",
+        "adjacent."))
 show_fig("_fusions", "Recurrent fusions")
 absent("_fusions", toggle = "run_fusions",
        data_reason = "No fusion calls were available for this cohort.")
@@ -324,6 +611,19 @@ dt_show(read_tbl("_fusions\\.tsv$"), "Recurrent fusions (DNA+RNA supported flagg
 ## Stratified comparison
 
 ```{r comp, results='asis'}
+fig_note(
+  "Stratified comparison — two groups, same cohort",
+  paste("The cohort split by a clinical variable and compared four ways: a",
+        "side-by-side oncoplot, a per-gene test of mutation frequency between",
+        "groups, gene-level copy-number differences, and genome instability",
+        "(FGA) by group. Sex chromosomes are excluded, because when stratifying",
+        "by sex every gene on X or Y separates perfectly for reasons of",
+        "karyotype rather than tumour biology."),
+  paste("genes are chosen from this same cohort's mutation frequencies and then",
+        "tested on it, so the p-values are optimistic. Tests are labelled",
+        "unadjusted unless a covariate actually varies — within a single",
+        "institution, nothing is being adjusted for. Read a null result here as",
+        "'underpowered' rather than 'no difference'."))
 show_fig("_comparative", "Stratified comparison")
 absent("_comparative", toggle = "run_comparative",
        data_reason = "Not enough patients per group for a meaningful comparison.")

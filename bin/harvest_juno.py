@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import hashlib
 import json
 import os
 import subprocess
@@ -127,8 +128,29 @@ def rclone_available() -> None:
     print(f"[harvest] {p.stdout.splitlines()[0]}")
 
 
+# Top-level directories under a cohort prefix that hold no per-patient
+# deliverables, and are excluded from the LISTING (not merely from selection).
+#
+# This matters for speed, not correctness: the glob patterns already reject
+# these paths, but rclone still has to enumerate every object before the
+# patterns are applied. MoHQ-MU-16 carries a `companions/` folder of NovaSeq
+# run directories -- raw sequencing output, orders of magnitude more objects
+# than the deliverables -- and listing it makes a dry run appear to hang.
+#
+# MoHQ-HM-19 had none of these, which is why the original assumed a cohort
+# prefix contains only patient directories.
+#
+# NOT excluded by default: dated batch directories such as
+# `20231122_vepvcfs/`, which DO contain deliverables (PCGR VCFs that were
+# never filed back into the patient folders).
+DEFAULT_EXCLUDES: tuple[str, ...] = (
+    "companions/**",   # sequencing run folders, raw data
+    "extras/**",       # per-patient re-analyses (SVariants/, sequenza/)
+)
+
+
 def list_cohort(remote: str, cohort_path: str, cache: Path | None,
-                refresh: bool) -> list[dict]:
+                refresh: bool, excludes: tuple[str, ...] = ()) -> list[dict]:
     """One recursive listing of a cohort prefix. Cached to disk.
 
     Uses `rclone lsjson --recursive --files-only`, which returns Path/Size/
@@ -138,15 +160,30 @@ def list_cohort(remote: str, cohort_path: str, cache: Path | None,
     """
     if cache and cache.exists() and not refresh:
         age_h = (time.time() - cache.stat().st_mtime) / 3600
-        print(f"[harvest] reusing cached listing ({age_h:.1f} h old): {cache}")
+        # A stale listing is not just slow -- it means the whole selection
+        # report describes the object store as it was days ago, and nothing
+        # touches the remote until the transfer. Say so loudly past a day.
+        if age_h > 24:
+            print(f"[harvest] WARNING: cached listing is {age_h:.0f} h old ({cache}).\n"
+                  f"          Everything below is computed from that snapshot, and the\n"
+                  f"          remote is not contacted until the copy. Use --refresh-listing\n"
+                  f"          to re-list before trusting the numbers.", file=sys.stderr)
+        else:
+            print(f"[harvest] reusing cached listing ({age_h:.1f} h old): {cache}")
         return json.loads(cache.read_text())
 
     src = f"{remote}/{cohort_path}" if cohort_path else remote
+    ex_args: list[str] = []
+    for pat in excludes:
+        ex_args += ["--exclude", pat]
+    if excludes:
+        print(f"[harvest] excluding from listing: {', '.join(excludes)}")
     print(f"[harvest] listing {src} ...", flush=True)
     t0 = time.time()
     # --fast-list issues far fewer LIST requests on S3-compatible backends at
     # the cost of holding the listing in memory, which is the right trade here.
-    p = run(["rclone", "lsjson", "--recursive", "--files-only", "--fast-list", src],
+    p = run(["rclone", "lsjson", "--recursive", "--files-only", "--fast-list",
+             *ex_args, src],
             capture_output=True)
     if p.returncode != 0:
         sys.exit(f"rclone lsjson failed:\n{p.stderr}")
@@ -194,6 +231,12 @@ def main(argv=None) -> int:
     ap.add_argument("--sets", nargs="+", default=["core"],
                     choices=sorted(HARVEST_SETS) + ["all"],
                     help="Which harvest sets to pull (default: core)")
+    ap.add_argument("--exclude", action="append", metavar="GLOB",
+                    help="rclone --exclude pattern applied to the LISTING. "
+                         "Repeatable. Defaults to "
+                         f"{' and '.join(DEFAULT_EXCLUDES)}, which hold no "
+                         "per-patient deliverables and can be very large. "
+                         "Pass --exclude '' to list everything.")
     ap.add_argument("--transfers", type=int, default=16)
     ap.add_argument("--checkers", type=int, default=16)
     ap.add_argument("--cache-dir", type=Path, default=Path(".harvest_cache"))
@@ -208,6 +251,26 @@ def main(argv=None) -> int:
                     help="Extra flags passed through to rclone copy")
     args = ap.parse_args(argv)
 
+    # ------------------------------------------------------------------ #
+    # Validate the remote BEFORE anything else.
+    #
+    # `--remote juno:$MOHQ_PROJECT:MOH-Q` with MOHQ_PROJECT unset expands to
+    # "juno::MOH-Q" -- an empty middle component. Everything up to the transfer
+    # then appeared to work, because the listing came from cache, and the run
+    # printed a full per-pattern breakdown of 1,164 files before rclone failed
+    # with "directory not found". Several minutes spent looking at a report
+    # about a remote that was never contacted.
+    #
+    # An empty component is never valid, so refuse immediately and say why.
+    # ------------------------------------------------------------------ #
+    parts = args.remote.split(":")
+    if any(p == "" for p in parts[:-1]) or len(parts) < 2:
+        print(f"[harvest] MALFORMED --remote: {args.remote!r}\n"
+              f"          An empty component usually means an unset environment\n"
+              f"          variable. Expected  <remote>:<project>:<bucket>\n"
+              f"          Check:  echo \"MOHQ_PROJECT=[$MOHQ_PROJECT]\"", file=sys.stderr)
+        return 2
+
     rclone_available()
 
     sets = sorted(HARVEST_SETS) if "all" in args.sets else args.sets
@@ -215,8 +278,16 @@ def main(argv=None) -> int:
     print(f"[harvest] sets: {', '.join(sets)}  ({len(patterns)} patterns)")
 
     cohort_name = args.cohort.rstrip("/").split("/")[-1]
-    cache = args.cache_dir / f"{cohort_name}.lsjson.json"
-    entries = list_cohort(args.remote, args.cohort, cache, args.refresh_listing)
+    excludes = tuple(args.exclude) if args.exclude is not None else DEFAULT_EXCLUDES
+
+    # The cache key includes the exclusions. Without this, a listing made with
+    # one set of exclusions would be silently reused for a different set --
+    # so `--exclude ''` to list everything would return the filtered snapshot
+    # and appear to have done nothing.
+    key = hashlib.sha1("|".join(sorted(excludes)).encode()).hexdigest()[:8]
+    cache = args.cache_dir / f"{cohort_name}.{key}.lsjson.json"
+    entries = list_cohort(args.remote, args.cohort, cache,
+                          args.refresh_listing, excludes)
     if not entries:
         print(f"[harvest] nothing listed under {args.cohort}", file=sys.stderr)
         return 2

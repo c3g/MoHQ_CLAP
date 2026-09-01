@@ -196,14 +196,38 @@ process FILTER_ENSEMBLE {
         exit 1
     fi
 
-    # Delivered patients land near ~24k here. An order of magnitude out means
-    # the filters did not apply as they did in the original runs; warn loudly
-    # rather than fail, since real biological spread exists.
+    # Delivered patients in the cohorts seen so far land near ~24k here. An
+    # order of magnitude out CAN mean the filters did not apply as they did in
+    # the original runs -- but it can equally be real: melanoma, MSI and POLE
+    # tumours legitimately carry hundreds of thousands of somatic variants.
+    # So warn, never fail, and say both possibilities out loud.
     if [ "\$n_flt" -gt 200000 ]; then
         echo "WARNING: \$n_flt variants survived filtering for ${patient_id}." >&2
-        echo "Delivered patients are ~24k. Check TDP/TVAF are populated:" >&2
-        bcftools view -H ${outflt} | head -1 | cut -f8 | tr ';' '\\n' \\
-            | grep -E '^(TAL|TDP|TVAF|NDP|NVAF)=' | sed 's/^/  /' >&2
+        echo "  Cohorts seen so far land near ~24k. Hypermutated tumour types" >&2
+        echo "  (melanoma, MSI, POLE) reach this range legitimately -- check the" >&2
+        echo "  tumour type before treating it as a filtering failure. Tags:" >&2
+
+        # SIGPIPE-SAFE, and this is why it matters here.
+        #
+        # The previous form was:
+        #     bcftools view -H ... | head -1 | cut -f8 | tr ... | grep ...
+        # `head -1` closes the pipe after one line, bcftools is killed with
+        # SIGPIPE, and under `set -euo pipefail` that 141 becomes the task's
+        # exit status. So the diagnostic written FOR hypermutated samples
+        # killed exactly the hypermutated samples -- and only them, which is
+        # why it went unnoticed until a melanoma cohort crossed the threshold.
+        #
+        # pipefail off for this one line: the awk exit status is what matters,
+        # and a diagnostic must never be able to fail the step it describes.
+        set +o pipefail
+        bcftools view -H ${outflt} 2>/dev/null \\
+          | awk 'NR==1 {
+                   n = split(\$8, a, ";")
+                   for (i = 1; i <= n; i++)
+                     if (a[i] ~ /^(TAL|TDP|TVAF|NDP|NVAF)=/) print "  " a[i]
+                   exit
+                 }' >&2 || true
+        set -o pipefail
     fi
     """
 
